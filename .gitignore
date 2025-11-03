@@ -1,0 +1,8 @@
+codepack.zip
+patch.diff
+tmp_*.diff
+target/
+logs/
+
+spot_sbe/
+spot_sbe_tmp/
