@@ -19,25 +19,33 @@ jobs:
       - name: Ensure Copilot instructions exist
         run: test -f .github/copilot-instructions.md
 
-      - name: Validate header & required log tags in instructions (robust)
+      - name: Validate header & required log tags in instructions (token-based, debug)
         shell: bash
         run: |
-          python3 - << 'PY'
-          import io, sys, re, unicodedata
-          p = ".github/copilot-instructions.md"
-          with io.open(p, "r", encoding="utf-8-sig") as f:
-              first = f.readline().strip()
-          norm = unicodedata.normalize("NFKC", first)
-          pat = re.compile(r'^#\s*إرشادات\s+Copilot\s+[\u2014\u2013\-–—\s\W]+sbe_latency_bot\s*$', re.U)
-          if not pat.search(norm):
-              print("First line (raw):", first.encode("utf-8"))
-              print("First line (NFKC):", norm.encode("utf-8"))
-              sys.exit(1)
-          text = io.open(p, "r", encoding="utf-8-sig").read()
-          for t in ("[BOOT]","[HARAM]","[SHADOW]","[BUY]","[SELL]"):
-              if t not in text:
-                  print("Missing tag:", t); sys.exit(1)
-          PY
+          set -euo pipefail
+          echo "First line (debug):"
+          head -n1 .github/copilot-instructions.md | cat -A
+          echo "MIME (debug):"
+          file -bi .github/copilot-instructions.md
+
+          first="$(head -n1 .github/copilot-instructions.md)"
+
+          # لازم يبدأ بعلامة عنوان #
+          case "$first" in
+            \#*) ;; 
+            *) echo "Header must start with '#' on line 1"; exit 1;;
+          esac
+
+          # توكِنز مطلوبة في السطر الأول (نتجنّب مشاكل الشرطة/التطبيع)
+          grep -q "Copilot" <<<"$first"
+          grep -q "sbe_latency_bot" <<<"$first"
+
+          # الوسوم الخمسة لازم تكون موجودة في نفس الملف
+          grep -q "\[BOOT\]"   .github/copilot-instructions.md
+          grep -q "\[HARAM\]"  .github/copilot-instructions.md
+          grep -q "\[SHADOW\]" .github/copilot-instructions.md
+          grep -q "\[BUY\]"    .github/copilot-instructions.md
+          grep -q "\[SELL\]"   .github/copilot-instructions.md
 
       - name: Warn if schemas changed (clean build recommended)
         shell: bash
