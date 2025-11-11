@@ -1,4 +1,5 @@
-﻿
+﻿# إرشادات Copilot — sbe_latency_bot
+
 > Quickstart: build cargo build --release  safe run cargo run --release --features shadow-mode  schema change  cargo clean && cargo build --release  وسوم السجلات ثابتة: [BOOT][HARAM][SHADOW][BUY][SELL]  Reset 03:00 KSA  Universe: USDT فقط مع استبعاد UP/DOWN/BULL/BEAR + HARAM.
 # ط¥ط±ط´ط§ط¯ط§طھ Copilot â€” sbe_latency_bot
 # Copilot Instructions â€” sbe_latency_bot
@@ -64,6 +65,8 @@ If youâ€™re an AI agent starting a task:
 4) For schema changes, regenerate decoder and do a clean rebuild.
 
 If any section is unclear or you want a 1-line quickstart or an expanded onboarding checklist, tell me which part to adjust.
+
+
 
 
 
