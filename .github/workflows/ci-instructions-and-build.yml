@@ -39,7 +39,7 @@ jobs:
           done
 
   build:
-    name: Build (shadow-mode)
+    name: Build release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +64,7 @@ jobs:
       - name: Build release (shadow-mode)
         run: |
           set -o pipefail
-          cargo build --release --features shadow-mode |& tee logs/build.log
+          cargo build --release |& tee logs/build.log
 
       - name: Append build tail to Step Summary
         if: always()
