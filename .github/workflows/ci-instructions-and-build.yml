@@ -1,4 +1,5 @@
-﻿name: CI – Copilot instructions & build
+﻿
+name: CI – Copilot instructions & build
 
 on:
   push:
@@ -18,20 +19,25 @@ jobs:
       - name: Ensure Copilot instructions exist
         run: test -f .github/copilot-instructions.md
 
-      - name: Validate header & required log tags in instructions
+      - name: Validate header & required log tags in instructions (robust)
         shell: bash
         run: |
-          echo "First line (debug):"
-          head -n1 .github/copilot-instructions.md | cat -A
-          echo "MIME (debug):"
-          file -bi .github/copilot-instructions.md
-          # accept em-dash, hyphen, or any non-alnum separator between words
-          egrep -q "إرشادات Copilot (—|-|[^[:alnum:]])+sbe_latency_bot" .github/copilot-instructions.md
-          grep -q "[BOOT]"   .github/copilot-instructions.md
-          grep -q "[HARAM]"  .github/copilot-instructions.md
-          grep -q "[SHADOW]" .github/copilot-instructions.md
-          grep -q "[BUY]"    .github/copilot-instructions.md
-          grep -q "[SELL]"   .github/copilot-instructions.md
+          python3 - << 'PY'
+          import io, sys, re, unicodedata
+          p = ".github/copilot-instructions.md"
+          with io.open(p, "r", encoding="utf-8-sig") as f:
+              first = f.readline().strip()
+          norm = unicodedata.normalize("NFKC", first)
+          pat = re.compile(r'^#\s*إرشادات\s+Copilot\s+[\u2014\u2013\-–—\s\W]+sbe_latency_bot\s*$', re.U)
+          if not pat.search(norm):
+              print("First line (raw):", first.encode("utf-8"))
+              print("First line (NFKC):", norm.encode("utf-8"))
+              sys.exit(1)
+          text = io.open(p, "r", encoding="utf-8-sig").read()
+          for t in ("[BOOT]","[HARAM]","[SHADOW]","[BUY]","[SELL]"):
+              if t not in text:
+                  print("Missing tag:", t); sys.exit(1)
+          PY
 
       - name: Warn if schemas changed (clean build recommended)
         shell: bash
