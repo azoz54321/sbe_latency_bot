@@ -9,7 +9,8 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write   # <-- ضروري لرفع artifacts
+  id-token: write
 
 jobs:
   guard-instructions:
@@ -66,7 +67,7 @@ jobs:
           cargo build --release --features shadow-mode 2>&1 | tee logs/build.log
 
       - name: Upload CI logs
-        if: always()
+        if: always()          # <-- حتى لو فشل البناء
         uses: actions/upload-artifact@v4
         with:
           name: ci-logs
