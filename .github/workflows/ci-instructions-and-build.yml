@@ -5,12 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write   # <-- ضروري لرفع artifacts
-  id-token: write
+  actions: write
 
 jobs:
   guard-instructions:
@@ -20,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - name: Validate instructions (token-based, debug)
         shell: bash
         run: |
@@ -64,11 +64,19 @@ jobs:
       - name: Build release (shadow-mode)
         run: |
           set -o pipefail
-          cargo build --release --features shadow-mode 2>&1 | tee logs/build.log
+          cargo build --release --features shadow-mode |& tee logs/build.log
+
+      - name: Append build tail to Step Summary
+        if: always()
+        run: |
+          echo '### Build tail (last 200 lines)' >> $GITHUB_STEP_SUMMARY
+          (tail -n 200 logs/build.log || true) >> $GITHUB_STEP_SUMMARY
 
       - name: Upload CI logs
-        if: always()          # <-- حتى لو فشل البناء
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ci-logs
           path: logs/*
+          if-no-files-found: warn
+          retention-days: 7
