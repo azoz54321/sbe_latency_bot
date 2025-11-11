@@ -19,7 +19,7 @@ jobs:
       - name: Validate header & required log tags in instructions
         shell: bash
         run: |
-          grep -q "إرشادات Copilot — sbe_latency_bot" .github/copilot-instructions.md
+          egrep -q "إرشادات Copilot (—|-)\s+sbe_latency_bot" .github/copilot-instructions.md
           grep -q "[BOOT]"   .github/copilot-instructions.md
           grep -q "[HARAM]"  .github/copilot-instructions.md
           grep -q "[SHADOW]" .github/copilot-instructions.md

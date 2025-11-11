@@ -1,4 +1,6 @@
 ﻿# إرشادات Copilot — sbe_latency_bot
+## أمثلة وسوم
+[BOOT] [HARAM] [SHADOW] [BUY] [SELL]
 
 > Quickstart: build cargo build --release  safe run cargo run --release --features shadow-mode  schema change  cargo clean && cargo build --release  وسوم السجلات ثابتة: [BOOT][HARAM][SHADOW][BUY][SELL]  Reset 03:00 KSA  Universe: USDT فقط مع استبعاد UP/DOWN/BULL/BEAR + HARAM.
 # ط¥ط±ط´ط§ط¯ط§طھ Copilot â€” sbe_latency_bot
