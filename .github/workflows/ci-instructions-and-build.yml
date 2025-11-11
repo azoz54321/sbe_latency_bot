@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch: {}
 
 jobs:
   guard-instructions:
@@ -25,7 +26,6 @@ jobs:
           head -n1 .github/copilot-instructions.md | cat -A
           first="$(head -n1 .github/copilot-instructions.md)"
           case "$first" in \#*) ;; *) echo "::warning::Header should start with '#' on line 1";; esac
-          # tokens فقط لتفادي Unicode traps
           grep -q "Copilot" <<<"$first" || echo "::warning::First line should contain 'Copilot'"
           grep -q "sbe_latency_bot" <<<"$first" || echo "::warning::First line should contain 'sbe_latency_bot'"
           for t in "[BOOT]" "[HARAM]" "[SHADOW]" "[BUY]" "[SELL]"; do
@@ -37,15 +37,25 @@ jobs:
   build:
     name: Build (shadow-mode)
     runs-on: ubuntu-latest
-    # مافي needs؛ حتى لو guard فشل، البِلد يشتغل
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Install native toolchain (cmake, gcc, deps)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config libssl-dev \
-            clang llvm-dev libclang-dev ninja-build
+            clang llvm-dev libclang-dev ninja-build zlib1g-dev
+
       - name: Build release (shadow-mode)
-        run: cargo build --release --features shadow-mode
+        run: |
+          set -o pipefail
+          cargo build --release --features shadow-mode 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
