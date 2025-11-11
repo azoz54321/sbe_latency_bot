@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 use once_cell::sync::Lazy;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::Clock;
@@ -20,6 +23,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub strategy: StrategyConfig,
     pub metrics: MetricsConfig,
+    pub tp_adjust: TpAdjustConfig,
+    pub user_stream: UserStreamConfig,
 }
 
 impl Config {
@@ -27,7 +32,7 @@ impl Config {
         Self {
             transport: TransportConfig {
                 sbe_ws_url: SBE_WS_URL,
-                rest_base_url: "https://api.binance.com",
+                rest_base_url: "https://api1.binance.com",
             },
             credentials: Credentials {
                 sbe_ws_api_key: BINANCE_SBE_API_KEY,
@@ -56,16 +61,7 @@ impl Config {
                 latency_budget: Duration::from_millis(LATENCY_BUDGET_MS),
             },
             execution: ExecutionConfig {
-                mode: {
-                    #[cfg(feature = "test-mode")]
-                    {
-                        ExecutionMode::Live
-                    }
-                    #[cfg(not(feature = "test-mode"))]
-                    {
-                        ExecutionMode::Shadow
-                    }
-                },
+                mode: ExecutionMode::Shadow,
                 order_quote_size_usdt: ORDER_QUOTE_SIZE_USDT,
                 retry_on_fail: RETRY_ON_FAIL,
                 request_timeout: Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS),
@@ -94,19 +90,25 @@ impl Config {
                     ahi_drop_exit: AHI_DROP_EXIT,
                     enter_window: Duration::from_secs(AHI_WINDOW_ENTER_MINUTES * 60),
                     drop_window: Duration::from_secs(AHI_DROP_WINDOW_MINUTES * 60),
+                    compute_interval: Duration::from_secs(AHI_COMPUTE_INTERVAL_SECS),
+                    breadth_pos_threshold_bp: AHI_BREADTH_POS_THRESHOLD_BP,
+                    ethbtc_linear_fullscale_bp: AHI_ETHBTC_LINEAR_FULLSCALE_BP,
                 },
                 btc_15m_abs_enter: BTC_15M_ABS_ENTER,
                 btc_15m_abs_exit: BTC_15M_ABS_EXIT,
-                enable_metrics_test_only: {
-                    #[cfg(feature = "test-mode")]
-                    {
-                        true
-                    }
-                    #[cfg(not(feature = "test-mode"))]
-                    {
-                        ENABLE_METRICS_TEST_ONLY
-                    }
-                },
+                tp_pct: Decimal::from_f64(DEFAULT_TP_PCT).unwrap(),
+                sl_pct: Decimal::from_f64(DEFAULT_SL_PCT).unwrap(),
+                bounce_arm_pct: Decimal::from_f64(DEFAULT_BOUNCE_ARM_PCT).unwrap(),
+                maker_fee_pct: Decimal::from_f64(DEFAULT_MAKER_FEE_PCT).unwrap(),
+                taker_fee_pct: Decimal::from_f64(DEFAULT_TAKER_FEE_PCT).unwrap(),
+                daily_loss_freeze_pct: Decimal::from_f64(DEFAULT_DAILY_LOSS_FREEZE_PCT).unwrap(),
+                ban_losses_threshold: DEFAULT_BAN_LOSSES_THRESHOLD,
+                ban_window_days: DEFAULT_BAN_WINDOW_DAYS,
+                haram_symbols: DEFAULT_HARAM_SYMBOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                enable_metrics_test_only: ENABLE_METRICS_TEST_ONLY,
             },
             metrics: MetricsConfig {
                 tick_to_send_targets: LatencyTargets {
@@ -114,6 +116,16 @@ impl Config {
                     p95_ms: 15.0,
                     p99_ms: 20.0,
                 },
+            },
+            tp_adjust: TpAdjustConfig {
+                enabled: TP_ADJUST_ENABLED,
+                min_diff_ticks: TP_ADJUST_MIN_DIFF_TICKS,
+                timeout: Duration::from_millis(TP_ADJUST_TIMEOUT_MS),
+            },
+            user_stream: UserStreamConfig {
+                enabled: USER_STREAM_ENABLED,
+                keepalive_secs: USER_STREAM_KEEPALIVE_SECS,
+                listen_key: USER_STREAM_LISTEN_KEY,
             },
         }
     }
@@ -206,7 +218,10 @@ impl ShardingConfig {
                     return None;
                 }
                 let end = usize::min(start + self.shard_size, self.streams.len());
-                let symbols = &self.streams[start..end];
+                let symbols = self.streams[start..end]
+                    .iter()
+                    .map(|sym| sym.to_string())
+                    .collect::<Vec<_>>();
                 let cpu_core = *self
                     .cpu_pin_per_shard
                     .get(shard_index)
@@ -214,7 +229,7 @@ impl ShardingConfig {
 
                 Some(ShardAssignment {
                     shard_index,
-                    symbols,
+                    symbols: Arc::new(symbols),
                     cpu_core,
                 })
             })
@@ -222,22 +237,26 @@ impl ShardingConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShardAssignment {
     pub shard_index: usize,
-    pub symbols: &'static [&'static str],
+    pub symbols: Arc<Vec<String>>,
     pub cpu_core: usize,
 }
 
 impl ShardAssignment {
     pub fn websocket_url(&self, transport: &TransportConfig) -> String {
         if self.symbols.len() == 1 {
-            format!("{}/ws/{}@trade", transport.sbe_ws_url, self.symbols[0])
+            format!(
+                "{}/ws/{}@trade",
+                transport.sbe_ws_url,
+                self.symbols[0].to_ascii_lowercase()
+            )
         } else {
             let streams = self
                 .symbols
                 .iter()
-                .map(|sym| format!("{}@trade", sym))
+                .map(|sym| format!("{}@trade", sym.to_ascii_lowercase()))
                 .collect::<Vec<_>>()
                 .join("/");
             format!("{}/stream?streams={}", transport.sbe_ws_url, streams)
@@ -310,6 +329,20 @@ pub struct MetricsConfig {
     pub tick_to_send_targets: LatencyTargets,
 }
 
+#[derive(Debug, Clone)]
+pub struct TpAdjustConfig {
+    pub enabled: bool,
+    pub min_diff_ticks: u32,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserStreamConfig {
+    pub enabled: bool,
+    pub keepalive_secs: u64,
+    pub listen_key: Option<&'static str>,
+}
+
 #[derive(Debug)]
 pub struct StrategyConfig {
     pub warmup_secs: u64,
@@ -318,6 +351,15 @@ pub struct StrategyConfig {
     pub ahi: AhiConfig,
     pub btc_15m_abs_enter: f64,
     pub btc_15m_abs_exit: f64,
+    pub tp_pct: Decimal,
+    pub sl_pct: Decimal,
+    pub bounce_arm_pct: Decimal,
+    pub maker_fee_pct: Decimal,
+    pub taker_fee_pct: Decimal,
+    pub daily_loss_freeze_pct: Decimal,
+    pub ban_losses_threshold: u32,
+    pub ban_window_days: u32,
+    pub haram_symbols: Vec<String>,
     pub enable_metrics_test_only: bool,
 }
 
@@ -329,6 +371,9 @@ pub struct AhiConfig {
     pub ahi_drop_exit: f64,
     pub enter_window: Duration,
     pub drop_window: Duration,
+    pub compute_interval: Duration,
+    pub breadth_pos_threshold_bp: i32,
+    pub ethbtc_linear_fullscale_bp: i32,
 }
 
 #[derive(Debug)]
@@ -395,18 +440,38 @@ const MARKET_CHANNEL_CAPACITY: usize = 8192;
 const TRIGGER_CHANNEL_CAPACITY: usize = 1024;
 const LOG_CHANNEL_CAPACITY: usize = 2048;
 
-const SBE_STREAMS: [&str; 1] = ["btcusdt"];
+const SBE_STREAMS: [&str; 2] = ["ETHUSDT", "SOLUSDT"];
 
-const WARMUP_SECS: u64 = 60;
+const WARMUP_SECS: u64 = 3;
 const WINDOW_RET_60S_MS: u64 = 60_000;
 const DAILY_RESET_HOUR_KSA: u8 = 3;
-const AHI_ENTER: f64 = 60.0;
+const AHI_ENTER: f64 = 60.0; //60.0
 const AHI_ENTER_AFTER_LOSS: f64 = 62.0;
 const AHI_EXIT: f64 = 50.0;
 const AHI_DROP_EXIT: f64 = 15.0;
 const AHI_WINDOW_ENTER_MINUTES: u64 = 3;
 const AHI_DROP_WINDOW_MINUTES: u64 = 5;
-const BTC_15M_ABS_ENTER: f64 = 0.012;
+const AHI_COMPUTE_INTERVAL_SECS: u64 = 30;
+const AHI_BREADTH_POS_THRESHOLD_BP: i32 = 0;
+const AHI_ETHBTC_LINEAR_FULLSCALE_BP: i32 = 200;
+const BTC_15M_ABS_ENTER: f64 = 0.012; // 0.012
 const BTC_15M_ABS_EXIT: f64 = 0.018;
+const DEFAULT_TP_PCT: f64 = 0.10;
+const DEFAULT_SL_PCT: f64 = 0.05;
+const DEFAULT_BOUNCE_ARM_PCT: f64 = 0.05;
+const DEFAULT_MAKER_FEE_PCT: f64 = 0.0002;
+const DEFAULT_TAKER_FEE_PCT: f64 = 0.0004;
+const DEFAULT_DAILY_LOSS_FREEZE_PCT: f64 = 0.10;
+const DEFAULT_BAN_LOSSES_THRESHOLD: u32 = 3;
+const DEFAULT_BAN_WINDOW_DAYS: u32 = 30;
+const DEFAULT_HARAM_SYMBOLS: [&str; 0] = [];
 const ENABLE_METRICS_TEST_ONLY: bool = false;
 const KSA_OFFSET_SECS: i32 = 3 * 60 * 60;
+
+const TP_ADJUST_ENABLED: bool = true;
+const TP_ADJUST_MIN_DIFF_TICKS: u32 = 2;
+const TP_ADJUST_TIMEOUT_MS: u64 = 1_200;
+
+const USER_STREAM_ENABLED: bool = false;
+const USER_STREAM_KEEPALIVE_SECS: u64 = 1_500;
+const USER_STREAM_LISTEN_KEY: Option<&'static str> = None;

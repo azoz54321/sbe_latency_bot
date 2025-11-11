@@ -1,28 +1,134 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::capital::SlotId;
-use crate::types::Symbol;
+use rust_decimal::Decimal;
 
-const STOP_LOSS_PCT: f64 = 0.05;
-const TAKE_PROFIT_PCT: f64 = 0.10;
-const PROFIT_PROTECT_PCT: f64 = 0.05;
+use crate::capital::SlotId;
+use crate::config::StrategyConfig;
+use crate::types::Symbol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
+    TakeProfitLimit,
     StopLoss,
-    ProfitProtect,
+    ReturnToEntry,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitDecision {
+    Hold,
+    LimitFilled,
+    Market { reason: ExitReason },
+}
+
+#[derive(Debug, Clone)]
 pub struct Position {
     pub symbol: Symbol,
-    pub entry_price: f64,
-    pub qty: f64,
-    pub take_profit: f64,
+    pub qty: Decimal,
+    pub entry_price: Decimal,
+    pub entry_ts: Instant,
+    pub high_water: Decimal,
+    pub bounce_armed: bool,
+    pub closing: bool,
     pub slot: SlotId,
-    pub opened_at: Instant,
-    reach_protect: bool,
+    pub take_profit: Decimal,
+    pub stop_loss: Decimal,
+    pub bounce_break_even: Decimal,
+    pub tp_order_id: Option<String>,
+    pub tp_order_qty: Decimal,
+    pub tp_adjust_done: bool,
+    pub tp_initial_price: Decimal,
+    pub tp_current_price: Decimal,
+}
+
+impl Position {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        symbol: Symbol,
+        qty: Decimal,
+        entry_price: Decimal,
+        slot: SlotId,
+        now: Instant,
+        take_profit: Decimal,
+        stop_loss: Decimal,
+        bounce_break_even: Decimal,
+        tp_order_id: Option<String>,
+        tp_order_qty: Decimal,
+    ) -> Self {
+        Self {
+            symbol,
+            qty,
+            entry_price,
+            entry_ts: now,
+            high_water: entry_price,
+            bounce_armed: false,
+            closing: false,
+            slot,
+            take_profit,
+            stop_loss,
+            bounce_break_even,
+            tp_order_id,
+            tp_order_qty,
+            tp_adjust_done: false,
+            tp_initial_price: take_profit,
+            tp_current_price: take_profit,
+        }
+    }
+
+    pub fn on_tick(&mut self, px: Decimal, cfg: &StrategyConfig) -> ExitDecision {
+        if self.closing {
+            return ExitDecision::Hold;
+        }
+
+        if px > self.high_water {
+            self.high_water = px;
+        }
+
+        if px <= self.stop_loss {
+            self.closing = true;
+            return ExitDecision::Market {
+                reason: ExitReason::StopLoss,
+            };
+        }
+
+        if !self.bounce_armed {
+            let arm_threshold = self.entry_price * (Decimal::ONE + cfg.bounce_arm_pct);
+            if self.high_water >= arm_threshold {
+                self.bounce_armed = true;
+            }
+        }
+
+        if px >= self.take_profit {
+            self.closing = true;
+            return ExitDecision::LimitFilled;
+        }
+
+        if self.bounce_armed && px <= self.bounce_break_even {
+            self.closing = true;
+            return ExitDecision::Market {
+                reason: ExitReason::ReturnToEntry,
+            };
+        }
+
+        ExitDecision::Hold
+    }
+
+    pub fn mark_closing_failed(&mut self) {
+        self.closing = false;
+    }
+
+    pub fn clear_tp_target(&mut self) {
+        self.tp_order_id = None;
+        self.tp_order_qty = Decimal::ZERO;
+        self.tp_current_price = Decimal::ZERO;
+    }
+
+    pub fn apply_tp_adjust(&mut self, new_price: Decimal, new_order_id: String) {
+        self.take_profit = new_price;
+        self.tp_current_price = new_price;
+        self.tp_order_id = Some(new_order_id);
+        self.tp_adjust_done = true;
+    }
 }
 
 #[derive(Debug)]
@@ -40,17 +146,32 @@ impl PositionBook {
         }
     }
 
-    pub fn open(&mut self, symbol: Symbol, entry_price: f64, qty: f64, slot: SlotId, now: Instant) {
-        let take_profit = entry_price * (1.0 + TAKE_PROFIT_PCT);
-        let position = Position {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        &mut self,
+        symbol: Symbol,
+        qty: Decimal,
+        entry_price: Decimal,
+        slot: SlotId,
+        now: Instant,
+        take_profit: Decimal,
+        stop_loss: Decimal,
+        bounce_break_even: Decimal,
+        tp_order_id: Option<String>,
+        tp_order_qty: Decimal,
+    ) {
+        let position = Position::new(
             symbol,
-            entry_price,
             qty,
-            take_profit,
+            entry_price,
             slot,
-            opened_at: now,
-            reach_protect: false,
-        };
+            now,
+            take_profit,
+            stop_loss,
+            bounce_break_even,
+            tp_order_id,
+            tp_order_qty,
+        );
         self.positions.insert(symbol, position);
     }
 
@@ -62,59 +183,45 @@ impl PositionBook {
         self.positions.contains_key(&symbol)
     }
 
-    pub fn evaluate_price(&mut self, symbol: Symbol, price: f64) -> Option<ExitReason> {
+    pub fn on_tick(
+        &mut self,
+        symbol: Symbol,
+        px: Decimal,
+        cfg: &StrategyConfig,
+    ) -> Option<ExitDecision> {
         let position = self.positions.get_mut(&symbol)?;
-        let stop_loss_price = position.entry_price * (1.0 - STOP_LOSS_PCT);
-        if price <= stop_loss_price {
-            return Some(ExitReason::StopLoss);
+        let decision = position.on_tick(px, cfg);
+        match decision {
+            ExitDecision::Hold => None,
+            other => Some(other),
         }
-
-        if price >= position.take_profit {
-            position.reach_protect = true;
-            return None;
-        }
-
-        let protect_threshold = position.entry_price * (1.0 + PROFIT_PROTECT_PCT);
-        if price >= protect_threshold {
-            position.reach_protect = true;
-            return None;
-        }
-
-        if position.reach_protect && price <= position.entry_price {
-            return Some(ExitReason::ProfitProtect);
-        }
-
-        None
     }
 
-    #[cfg(feature = "test-mode")]
-    pub fn snapshot(&self) -> PositionsSnapshot {
-        let mut open = self
-            .positions
-            .values()
-            .map(|pos| PositionEntry {
-                symbol: pos.symbol,
-                qty: pos.qty,
-                entry_price: pos.entry_price,
-                slot: pos.slot,
-            })
-            .collect::<Vec<_>>();
-        open.sort_by(|a, b| a.symbol.as_bytes().cmp(b.symbol.as_bytes()));
-        PositionsSnapshot { open }
+    pub fn mark_closing_failed(&mut self, symbol: Symbol) {
+        if let Some(position) = self.positions.get_mut(&symbol) {
+            position.mark_closing_failed();
+        }
     }
-}
 
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug, Default)]
-pub struct PositionsSnapshot {
-    pub open: Vec<PositionEntry>,
-}
+    pub fn record_tp_adjust(
+        &mut self,
+        symbol: Symbol,
+        new_price: Decimal,
+        new_order_id: String,
+    ) -> Option<SlotId> {
+        if let Some(position) = self.positions.get_mut(&symbol) {
+            position.apply_tp_adjust(new_price, new_order_id);
+            Some(position.slot)
+        } else {
+            None
+        }
+    }
 
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug)]
-pub struct PositionEntry {
-    pub symbol: Symbol,
-    pub qty: f64,
-    pub entry_price: f64,
-    pub slot: SlotId,
+    pub fn get(&self, symbol: Symbol) -> Option<&Position> {
+        self.positions.get(&symbol)
+    }
+
+    pub fn get_mut(&mut self, symbol: Symbol) -> Option<&mut Position> {
+        self.positions.get_mut(&symbol)
+    }
 }

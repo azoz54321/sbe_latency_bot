@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use rust_decimal::Decimal;
 
+use crate::capital::SlotId;
+
 pub const MAX_SYMBOL_LEN: usize = 16;
 
 pub type SymbolId = u64;
@@ -96,6 +98,12 @@ pub struct PriceEvent {
     pub seq: u64,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct ReconnectNotice {
+    pub shard_index: usize,
+    pub ts_mono_ns: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TriggerEvent {
     pub symbol: Symbol,
@@ -104,6 +112,7 @@ pub struct TriggerEvent {
     pub target_notional: Decimal,
     pub trigger_ts_mono_ns: u64,
     pub signal_ts_mono_ns: u64,
+    pub slot: SlotId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,6 +169,16 @@ pub enum MetricEvent {
     },
     TickToSend(TickToSendMetric),
     SignalSuppressed {
+        symbol: Symbol,
+    },
+    RiskFreezeDailyLoss,
+    RiskBanCreated {
+        symbol: Symbol,
+    },
+    RiskDenyRebuyToday {
+        symbol: Symbol,
+    },
+    RiskDenyHaram {
         symbol: Symbol,
     },
 }

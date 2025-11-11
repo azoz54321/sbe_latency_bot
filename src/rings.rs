@@ -64,6 +64,10 @@ impl RingBuffer {
         self.prune(ts);
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn head(&self) -> Option<TimedValue> {
         self.entries.back().copied()
     }
@@ -109,16 +113,22 @@ impl RingBuffer {
 #[derive(Debug)]
 pub struct SymbolRings {
     pub ring_60s: RingBuffer,
+    ring_15m: RingBuffer,
+    ring_1h: RingBuffer,
     last_price: Option<f64>,
     last_update: Option<Instant>,
+    boot_until: Option<Instant>,
 }
 
 impl SymbolRings {
     pub fn new(window_60s: Duration) -> Self {
         Self {
             ring_60s: RingBuffer::new(window_60s),
+            ring_15m: RingBuffer::new(Duration::from_secs(15 * 60)),
+            ring_1h: RingBuffer::new(Duration::from_secs(60 * 60)),
             last_price: None,
             last_update: None,
+            boot_until: None,
         }
     }
 
@@ -126,31 +136,55 @@ impl SymbolRings {
         self.last_price = Some(price);
         self.last_update = Some(ts);
         self.ring_60s.push(ts, price);
+        self.ring_15m.push(ts, price);
+        self.ring_1h.push(ts, price);
     }
 
     pub fn snapshot(&mut self, ts: Instant) {
         if let (Some(price), Some(last_ts)) = (self.last_price, self.last_update) {
             if ts > last_ts {
                 self.ring_60s.push(ts, price);
+                self.ring_15m.push(ts, price);
+                self.ring_1h.push(ts, price);
             }
         }
     }
 
     pub fn ret_60s(&self) -> Option<f64> {
-        let latest = self.ring_60s.head()?;
-        let past_price = self.ring_60s.value_at_offset(Duration::from_secs(60))?;
-        if past_price <= 0.0 {
-            return None;
-        }
-        Some((latest.value / past_price) - 1.0)
+        return_over(&self.ring_60s, Duration::from_secs(60))
     }
 
-    pub fn warm(&self) -> bool {
-        #[cfg(feature = "test-mode")]
-        if self.ring_60s.entries.len() >= 2 {
+    pub fn ret_15m(&self) -> Option<f64> {
+        return_over(&self.ring_15m, Duration::from_secs(15 * 60))
+    }
+
+    pub fn ret_1h(&self) -> Option<f64> {
+        return_over(&self.ring_1h, Duration::from_secs(60 * 60))
+    }
+
+    pub fn warm(&mut self, now: Instant) -> bool {
+        if let Some(until) = self.boot_until {
+            if now < until {
+                return false;
+            }
+            self.boot_until = None;
             return true;
         }
         self.ring_60s.is_saturated()
+    }
+
+    pub fn bootstrap(&mut self, ts: Instant, price: Option<f64>, hold: Duration) {
+        self.ring_60s.clear();
+        self.ring_15m.clear();
+        self.ring_1h.clear();
+        if let Some(value) = price {
+            self.ring_60s.push(ts, value);
+            self.ring_15m.push(ts, value);
+            self.ring_1h.push(ts, value);
+            self.last_price = Some(value);
+            self.last_update = Some(ts);
+        }
+        self.boot_until = Some(ts + hold);
     }
 }
 

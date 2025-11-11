@@ -6,3 +6,4 @@ logs/
 
 spot_sbe/
 spot_sbe_tmp/
+.deps/

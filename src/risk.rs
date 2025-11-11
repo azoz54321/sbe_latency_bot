@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,39 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::types::{symbol_id, Symbol, SymbolId};
 
-const LOSS_BAN_WINDOW_DAYS: i64 = 30;
-const DAILY_FREEZE_THRESHOLD: f64 = -0.10;
+use rust_decimal::Decimal;
+
+const ZERO_DEC: Decimal = Decimal::ZERO;
 
 #[derive(Copy, Clone, Debug)]
 pub enum DisableReason {
     OrderReject,
     FatalError,
+    DailyLoss,
+}
+
+#[derive(Debug)]
+pub enum TradeBlock {
+    GlobalFreeze {
+        first: bool,
+    },
+    NoRebuyUntil {
+        until: DateTime<FixedOffset>,
+        first: bool,
+    },
+    Disabled {
+        reason: DisableReason,
+    },
+    Banned {
+        until: DateTime<Utc>,
+        first: bool,
+    },
+}
+
+#[derive(Default)]
+pub struct RiskEffects {
+    pub freeze_triggered: bool,
+    pub banned_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -42,22 +68,20 @@ impl RiskHandle {
         let until = self.config.next_reset_time_ksa(now);
         self.table.insert(sym, until, reason);
     }
-
-    #[cfg(feature = "test-mode")]
-    pub fn clear_disables_for_tests(&self) {
-        self.table.clear_all_for_tests();
-    }
 }
 
 pub struct RiskEngine {
     config: &'static Config,
     clock: Arc<dyn Clock>,
-    daily_pnl: f64,
+    daily_pnl: Decimal,
     frozen: bool,
+    freeze_logged: bool,
     no_rebuy_until: HashMap<Symbol, DateTime<FixedOffset>>,
+    no_rebuy_logged: HashSet<Symbol>,
     penalties: HashMap<String, PenaltyRecord>,
     penalties_path: PathBuf,
     disable_table: Arc<DisableTable>,
+    ban_logged: HashSet<Symbol>,
 }
 
 impl RiskEngine {
@@ -72,82 +96,121 @@ impl RiskEngine {
         let engine = Self {
             config,
             clock: clock.clone(),
-            daily_pnl: 0.0,
+            daily_pnl: ZERO_DEC,
             frozen: false,
+            freeze_logged: false,
             no_rebuy_until: HashMap::new(),
+            no_rebuy_logged: HashSet::new(),
             penalties,
             penalties_path,
             disable_table: disable_table.clone(),
+            ban_logged: HashSet::new(),
         };
         let handle = RiskHandle::new(config, clock, disable_table);
 
         Ok((engine, handle))
     }
 
-    pub fn can_trade(&self, symbol: Symbol, now: DateTime<FixedOffset>) -> bool {
+    pub fn evaluate_trade(
+        &mut self,
+        symbol: Symbol,
+        now: DateTime<FixedOffset>,
+    ) -> Result<Option<TradeBlock>> {
         if self.frozen {
-            return false;
+            let first = !self.freeze_logged;
+            if first {
+                self.freeze_logged = true;
+            }
+            return Ok(Some(TradeBlock::GlobalFreeze { first }));
         }
 
-        if let Some(until) = self.no_rebuy_until.get(&symbol) {
-            if now < *until {
-                return false;
+        if let Some(until) = self.no_rebuy_until.get(&symbol).copied() {
+            if now < until {
+                let first = self.no_rebuy_logged.insert(symbol);
+                return Ok(Some(TradeBlock::NoRebuyUntil { until, first }));
+            } else {
+                self.no_rebuy_until.remove(&symbol);
+                self.no_rebuy_logged.remove(&symbol);
             }
         }
 
-        if self
-            .disable_table
-            .is_active(symbol_id(symbol), now)
-            .is_some()
-        {
-            return false;
+        if let Some(reason) = self.disable_table.is_active(symbol_id(symbol), now) {
+            return Ok(Some(TradeBlock::Disabled { reason }));
         }
 
         let key = symbol.to_string();
-        if let Some(record) = self.penalties.get(&key) {
+        if let Some(record) = self.penalties.get_mut(&key) {
             if let Some(until) = record.banned_until {
-                if now.with_timezone(&Utc) < until {
-                    return false;
+                let now_utc = now.with_timezone(&Utc);
+                if now_utc < until {
+                    let first = self.ban_logged.insert(symbol);
+                    return Ok(Some(TradeBlock::Banned { until, first }));
                 }
+                record.banned_until = None;
+                self.ban_logged.remove(&symbol);
+                self.persist_penalties()
+                    .with_context(|| "failed to persist penalties")?;
             }
         }
 
-        true
+        Ok(None)
     }
 
     pub fn mark_trade_open(&mut self, symbol: Symbol, now: DateTime<FixedOffset>) {
         let next_reset = self.config.next_reset_time_ksa(now);
         self.no_rebuy_until.insert(symbol, next_reset);
+        self.no_rebuy_logged.remove(&symbol);
     }
 
     pub fn mark_trade_close(
         &mut self,
         symbol: Symbol,
-        pnl_pct: f64,
+        pnl_return: Decimal,
+        is_loss: bool,
         now: DateTime<FixedOffset>,
-    ) -> anyhow::Result<()> {
-        self.daily_pnl += pnl_pct;
-        if self.daily_pnl <= DAILY_FREEZE_THRESHOLD {
+    ) -> anyhow::Result<RiskEffects> {
+        self.daily_pnl += pnl_return;
+        let freeze_threshold = self.config.strategy.daily_loss_freeze_pct;
+        let mut effects = RiskEffects::default();
+
+        if !self.frozen && self.daily_pnl <= -freeze_threshold {
             self.frozen = true;
+            self.freeze_logged = true;
+            effects.freeze_triggered = true;
         }
 
-        if pnl_pct < 0.0 {
-            self.register_loss(symbol, now)?;
+        if is_loss {
+            if let Some(until) = self.register_loss(symbol, now)? {
+                effects.banned_until = Some(until);
+                self.ban_logged.insert(symbol);
+            }
         }
 
-        Ok(())
+        Ok(effects)
     }
 
     #[allow(dead_code)]
     pub fn reset_daily_counters_keep_long_bans(&mut self) {
-        self.daily_pnl = 0.0;
+        self.daily_pnl = ZERO_DEC;
         self.frozen = false;
+        self.freeze_logged = false;
         self.no_rebuy_until.clear();
+        self.no_rebuy_logged.clear();
+        self.ban_logged.clear();
         let now = self.config.ksa_now(self.clock.as_ref());
         self.disable_table.clear_expired(now);
     }
 
-    fn register_loss(&mut self, symbol: Symbol, now: DateTime<FixedOffset>) -> anyhow::Result<()> {
+    fn register_loss(
+        &mut self,
+        symbol: Symbol,
+        now: DateTime<FixedOffset>,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let threshold = self.config.strategy.ban_losses_threshold;
+        if threshold == 0 {
+            return Ok(None);
+        }
+
         let key = symbol.to_string();
         let record = self
             .penalties
@@ -159,16 +222,21 @@ impl RiskEngine {
 
         let now_utc = now.with_timezone(&Utc);
         record.losses.push(now_utc);
-        let cutoff = now_utc - Duration::days(LOSS_BAN_WINDOW_DAYS);
+        let window_days = self.config.strategy.ban_window_days as i64;
+        let cutoff = now_utc - Duration::days(window_days);
         record.losses.retain(|ts| *ts >= cutoff);
 
-        if record.losses.len() >= 3 {
-            record.banned_until = Some(now_utc + Duration::days(LOSS_BAN_WINDOW_DAYS));
+        if (record.losses.len() as u32) >= threshold {
+            let until = now_utc + Duration::days(window_days);
+            record.banned_until = Some(until);
+            self.persist_penalties()
+                .with_context(|| "failed to persist penalties")?;
+            return Ok(Some(until));
         }
 
         self.persist_penalties()
             .with_context(|| "failed to persist penalties")?;
-        Ok(())
+        Ok(None)
     }
 
     fn persist_penalties(&self) -> anyhow::Result<()> {
@@ -188,7 +256,6 @@ fn ensure_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "test-mode"))]
 fn load_penalties(path: &Path) -> anyhow::Result<HashMap<String, PenaltyRecord>> {
     if !path.exists() {
         return Ok(HashMap::new());
@@ -196,23 +263,6 @@ fn load_penalties(path: &Path) -> anyhow::Result<HashMap<String, PenaltyRecord>>
     let bytes = fs::read(path)?;
     let penalties = serde_json::from_slice(&bytes)?;
     Ok(penalties)
-}
-
-#[cfg(feature = "test-mode")]
-fn load_penalties(_path: &Path) -> anyhow::Result<HashMap<String, PenaltyRecord>> {
-    Ok(HashMap::new())
-}
-
-#[cfg(feature = "test-mode")]
-impl RiskEngine {
-    pub fn snapshot(&self) -> RiskSnapshot {
-        RiskSnapshot {
-            daily_pnl: self.daily_pnl,
-            frozen: self.frozen,
-            disabled: self.disable_table.snapshot(),
-            no_rebuy: self.no_rebuy_until.keys().copied().collect(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -265,42 +315,10 @@ impl DisableTable {
             self.entries.remove(&key);
         }
     }
-
-    #[cfg(feature = "test-mode")]
-    fn clear_all_for_tests(&self) {
-        self.entries.clear();
-    }
-
-    #[cfg(feature = "test-mode")]
-    fn snapshot(&self) -> Vec<RiskDisabledEntry> {
-        self.entries
-            .iter()
-            .map(|entry| RiskDisabledEntry {
-                symbol_id: *entry.key(),
-                reason: entry.value().reason,
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct DisableEntry {
     until: DateTime<FixedOffset>,
     reason: DisableReason,
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug, Default)]
-pub struct RiskSnapshot {
-    pub daily_pnl: f64,
-    pub frozen: bool,
-    pub disabled: Vec<RiskDisabledEntry>,
-    pub no_rebuy: Vec<Symbol>,
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Copy, Debug)]
-pub struct RiskDisabledEntry {
-    pub symbol_id: SymbolId,
-    pub reason: DisableReason,
 }

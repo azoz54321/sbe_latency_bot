@@ -1,16 +1,11 @@
 use std::collections::HashMap;
-#[cfg(not(feature = "test-mode"))]
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::anyhow;
-#[cfg(not(feature = "test-mode"))]
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
-#[cfg(not(feature = "test-mode"))]
 use reqwest::blocking::Client;
 use rust_decimal::Decimal;
-#[cfg(not(feature = "test-mode"))]
 use serde::Deserialize;
 
 use crate::types::{symbol_id_from_str, SymbolId};
@@ -22,7 +17,6 @@ pub struct SymbolFilters {
     pub min_notional: Decimal,
 }
 
-#[cfg(not(feature = "test-mode"))]
 #[derive(Clone)]
 pub struct FilterCache {
     inner: Arc<ArcSwap<HashMap<SymbolId, SymbolFilters>>>,
@@ -30,14 +24,7 @@ pub struct FilterCache {
     rest_base_url: &'static str,
 }
 
-#[cfg(feature = "test-mode")]
-#[derive(Clone)]
-pub struct FilterCache {
-    inner: Arc<ArcSwap<HashMap<SymbolId, SymbolFilters>>>,
-}
-
 impl FilterCache {
-    #[cfg(not(feature = "test-mode"))]
     pub fn new(
         seed: HashMap<SymbolId, SymbolFilters>,
         rest_base_url: &'static str,
@@ -54,17 +41,6 @@ impl FilterCache {
         })
     }
 
-    #[cfg(feature = "test-mode")]
-    pub fn new(
-        seed: HashMap<SymbolId, SymbolFilters>,
-        rest_base_url: &'static str,
-    ) -> anyhow::Result<Self> {
-        let _ = rest_base_url;
-        Ok(Self {
-            inner: Arc::new(ArcSwap::from_pointee(seed)),
-        })
-    }
-
     pub fn get(&self, id: SymbolId) -> Option<SymbolFilters> {
         self.inner.load_full().get(&id).copied()
     }
@@ -73,7 +49,6 @@ impl FilterCache {
         self.inner.store(Arc::new(snapshot));
     }
 
-    #[cfg(not(feature = "test-mode"))]
     pub fn refresh_symbol(&self, sym: &str) -> anyhow::Result<SymbolFilters> {
         let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.rest_base_url, sym);
         let response = self
@@ -105,31 +80,14 @@ impl FilterCache {
 
         Ok(filters)
     }
-
-    #[cfg(feature = "test-mode")]
-    pub fn refresh_symbol(&self, sym: &str) -> anyhow::Result<SymbolFilters> {
-        let current = self.inner.load_full();
-        let sym_id = symbol_id_from_str(sym);
-        let filters = current
-            .get(&sym_id)
-            .copied()
-            .or_else(|| current.values().copied().next())
-            .ok_or_else(|| anyhow!("no filters available for symbol {sym}"))?;
-        let mut next = (*current).clone();
-        next.insert(sym_id, filters);
-        self.inner.store(Arc::new(next));
-        Ok(filters)
-    }
 }
 
-#[cfg(not(feature = "test-mode"))]
 #[derive(Debug, Deserialize)]
 struct ExchangeInfoResponse {
     #[serde(default)]
     symbols: Vec<SymbolInfo>,
 }
 
-#[cfg(not(feature = "test-mode"))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SymbolInfo {
@@ -138,7 +96,6 @@ struct SymbolInfo {
     filters: Vec<SymbolFilter>,
 }
 
-#[cfg(not(feature = "test-mode"))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "filterType", rename_all = "SCREAMING_SNAKE_CASE")]
 enum SymbolFilter {
@@ -158,7 +115,6 @@ enum SymbolFilter {
     Other,
 }
 
-#[cfg(not(feature = "test-mode"))]
 fn extract_symbol_filters(filters: &[SymbolFilter]) -> anyhow::Result<SymbolFilters> {
     let mut step = None;
     let mut tick = None;

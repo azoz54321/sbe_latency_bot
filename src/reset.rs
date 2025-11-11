@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::clock::Clock;
 use crate::config::Config;
@@ -65,11 +65,26 @@ async fn perform_daily_reset(
     processor.force_watch_only();
     let epoch = processor.bump_epoch();
 
-    info!("[RESET] start epoch={}", epoch);
+    debug!("[RESET] start epoch={}", epoch);
 
     processor.reset_daily_state()?;
     execution.reset_metrics_daily()?;
-    info!("[RESET] metrics cleared");
+    debug!("[RESET] metrics cleared");
+
+    {
+        let rest_base = config.transport.rest_base_url;
+        let haram = &config.strategy.haram_symbols;
+        match reqwest::Client::builder()
+            .user_agent("sbe-latency-bot/spot-usdt-count")
+            .build()
+        {
+            Ok(http) => match universe::count_usdt_spot_symbols(&http, rest_base, haram).await {
+                Ok(n) => debug!("[RESET] usdt_spot_count={}", n),
+                Err(err) => debug!("[RESET] usdt_spot_count=error err={}", err),
+            },
+            Err(err) => debug!("[RESET] usdt_spot_count=error err={}", err),
+        }
+    }
 
     let universe = universe::build_universe(config, clock).await?;
     let filter_seed = universe.filter_seed();
@@ -86,21 +101,10 @@ async fn perform_daily_reset(
         processor_clone.enable_trading();
     });
 
-    info!(
+    debug!(
         "[RESET] done symbols={} warmup={}",
         symbol_count, warmup_secs
     );
 
-    Ok(())
-}
-#[cfg(feature = "test-mode")]
-pub async fn perform_daily_reset_for_tests(
-    config: &'static Config,
-    clock: &dyn Clock,
-    processor: &ProcessorHandle,
-    execution: &ExecutionHandle,
-) -> Result<()> {
-    perform_daily_reset(config, clock, processor, execution).await?;
-    processor.risk_handle().clear_disables_for_tests();
     Ok(())
 }

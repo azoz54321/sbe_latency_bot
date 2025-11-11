@@ -1,29 +1,22 @@
 use arc_swap::ArcSwap;
 
-use std::collections::HashMap;
-
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::str::FromStr;
-
 use std::sync::Arc;
-
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-
 use chrono::{DateTime, FixedOffset, Utc};
-
 use reqwest::Client;
-
 use rust_decimal::Decimal;
-
 use serde::Deserialize;
+use tracing::{info, warn};
 
 use crate::clock::Clock;
-
 use crate::config::Config;
-
 use crate::filters::SymbolFilters;
-
 use crate::types::{symbol_id_from_str, Symbol, SymbolId};
 
 const NEW_LISTING_CUTOFF: Duration = Duration::from_secs(60 * 60);
@@ -31,6 +24,122 @@ const NEW_LISTING_CUTOFF: Duration = Duration::from_secs(60 * 60);
 const LEVERAGED_SUFFIXES: &[&str] = &["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "HALFUSDT"];
 
 const STABLE_BASES: &[&str] = &["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI"];
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SymbolKey {
+    pub name: String,
+    pub symbol_id: u32,
+}
+
+pub fn load_haram_list<P: AsRef<Path>>(path: P) -> BTreeSet<String> {
+    let path_ref = path.as_ref();
+    match fs::read_to_string(path_ref) {
+        Ok(text) => {
+            let mut set = BTreeSet::new();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                set.insert(trimmed.to_ascii_uppercase());
+            }
+            set
+        }
+        Err(err) => {
+            warn!(
+                ?path_ref,
+                %err,
+                "[HARAM] file not found or unreadable; proceeding with empty set"
+            );
+            BTreeSet::new()
+        }
+    }
+}
+
+pub async fn get_usdt_spot_universe(
+    config: &'static Config,
+    haram_external: Option<&BTreeSet<String>>,
+) -> anyhow::Result<Vec<SymbolKey>> {
+    let client = Client::builder()
+        .user_agent("sbe-latency-bot/2.0")
+        .tcp_nodelay(true)
+        .build()
+        .context("building universe HTTP client")?;
+
+    let url = format!("{}/api/v3/exchangeInfo", config.transport.rest_base_url);
+    let payload = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetching exchangeInfo for USDT universe")?
+        .error_for_status()
+        .context("exchangeInfo HTTP status")?
+        .json::<ExInfo>()
+        .await
+        .context("decoding exchangeInfo payload")?;
+
+    let haram_config: HashSet<String> = config
+        .strategy
+        .haram_symbols
+        .iter()
+        .map(|s| s.to_ascii_uppercase())
+        .collect();
+    let haram_external = haram_external.map(|set| set.clone());
+
+    let mut entries = Vec::with_capacity(payload.symbols.len());
+    for info in payload.symbols.into_iter() {
+        if info.status != "TRADING" {
+            continue;
+        }
+        if info.quote_asset != "USDT" {
+            continue;
+        }
+        if !(info.is_spot_trading_allowed
+            || info
+                .permissions
+                .iter()
+                .any(|perm| perm.eq_ignore_ascii_case("SPOT")))
+        {
+            continue;
+        }
+        let symbol_upper = info.symbol.to_ascii_uppercase();
+        let is_haram = haram_config.contains(&symbol_upper)
+            || haram_external
+                .as_ref()
+                .map(|set| set.contains(&symbol_upper))
+                .unwrap_or(false);
+        if is_haram {
+            continue;
+        }
+        if LEVERAGED_SUFFIXES
+            .iter()
+            .any(|suffix| symbol_upper.ends_with(suffix))
+        {
+            continue;
+        }
+        if symbol_upper.ends_with("UP")
+            || symbol_upper.ends_with("DOWN")
+            || symbol_upper.ends_with("BULL")
+            || symbol_upper.ends_with("BEAR")
+        {
+            continue;
+        }
+
+        let symbol_id = derive_symbol_key_id(&symbol_upper);
+        entries.push(SymbolKey {
+            name: symbol_upper,
+            symbol_id,
+        });
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    info!("[BOOT] universe size={}", entries.len());
+    Ok(entries)
+}
+
+fn derive_symbol_key_id(symbol: &str) -> u32 {
+    symbol_id_from_str(symbol) as u32
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -123,10 +232,7 @@ pub async fn build_universe(
         .build()
         .context("building universe HTTP client")?;
 
-    let url = format!(
-        "{}/api/v3/exchangeInfo?permissions=SPOT",
-        config.transport.rest_base_url
-    );
+    let url = format!("{}/api/v3/exchangeInfo", config.transport.rest_base_url);
 
     let response = client
         .get(&url)
@@ -178,6 +284,15 @@ pub async fn build_universe(
         }
 
         if is_new_listing(&symbol_info, now_utc) {
+            continue;
+        }
+
+        if config
+            .strategy
+            .haram_symbols
+            .iter()
+            .any(|sym| sym.eq_ignore_ascii_case(&symbol_info.symbol))
+        {
             continue;
         }
 
@@ -280,6 +395,24 @@ struct ExchangeInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExInfo {
+    #[serde(default)]
+    symbols: Vec<ExSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExSymbol {
+    symbol: String,
+    status: String,
+    quote_asset: String,
+    #[serde(default)]
+    is_spot_trading_allowed: bool,
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SymbolInfo {
     symbol: String,
@@ -355,4 +488,47 @@ fn parse_symbol_filters(info: &SymbolInfo) -> Option<SymbolFilters> {
 
         _ => None,
     }
+}
+
+pub async fn count_usdt_spot_symbols(
+    client: &Client,
+    rest_base_url: &str,
+    haram: &[String],
+) -> anyhow::Result<usize> {
+    let url = format!("{}/api/v3/exchangeInfo", rest_base_url);
+    let ex = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ExInfo>()
+        .await?;
+
+    let haram_set: HashSet<String> = haram.iter().map(|s| s.to_ascii_uppercase()).collect();
+
+    let count = ex
+        .symbols
+        .into_iter()
+        .filter(|s| {
+            if s.status != "TRADING" || s.quote_asset != "USDT" {
+                return false;
+            }
+            if !(s.is_spot_trading_allowed || s.permissions.iter().any(|p| p == "SPOT")) {
+                return false;
+            }
+            if LEVERAGED_SUFFIXES
+                .iter()
+                .any(|suffix| s.symbol.ends_with(suffix))
+            {
+                return false;
+            }
+            let symbol_upper = s.symbol.to_ascii_uppercase();
+            if haram_set.contains(&symbol_upper) {
+                return false;
+            }
+            true
+        })
+        .count();
+
+    Ok(count)
 }

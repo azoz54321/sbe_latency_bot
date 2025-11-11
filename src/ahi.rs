@@ -1,11 +1,7 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::types::Symbol;
-
 #[derive(Debug)]
-pub struct AhiAggregator {
-    per_symbol: HashMap<Symbol, f64>,
+pub struct AhiHistory {
     timeline: Vec<AhiPoint>,
     max_window: Duration,
     latest_value: f64,
@@ -17,31 +13,23 @@ struct AhiPoint {
     value: f64,
 }
 
-impl AhiAggregator {
+impl AhiHistory {
     pub fn new(max_window: Duration) -> Self {
         Self {
-            per_symbol: HashMap::with_capacity(512),
-            timeline: Vec::with_capacity(4 * 60),
+            timeline: Vec::with_capacity(128),
             max_window,
             latest_value: 0.0,
         }
     }
 
-    pub fn update(&mut self, ts: Instant, symbol: Symbol, ret_60s: f64) -> f64 {
-        let score = normalize_ret(ret_60s);
-        if score.is_finite() {
-            self.per_symbol.insert(symbol, score);
-        }
+    pub fn record(&mut self, ts: Instant, value: f64) {
+        self.latest_value = value;
+        self.timeline.push(AhiPoint { ts, value });
+        self.prune(ts);
+    }
 
-        let aggregate = if self.per_symbol.is_empty() {
-            0.0
-        } else {
-            self.per_symbol.values().sum::<f64>() / self.per_symbol.len() as f64
-        };
-
-        self.latest_value = aggregate;
-        self.record(ts, aggregate);
-        aggregate
+    pub fn latest(&self) -> f64 {
+        self.latest_value
     }
 
     pub fn average_over(&self, now: Instant, window: Duration) -> f64 {
@@ -49,18 +37,16 @@ impl AhiAggregator {
             return self.latest_value;
         }
         let cutoff = now.checked_sub(window).unwrap_or(now);
-
         let mut acc = 0.0;
         let mut count = 0;
         for point in self.iter_recent(cutoff) {
             acc += point.value;
             count += 1;
         }
-
         if count == 0 {
             self.latest_value
         } else {
-            acc / (count as f64)
+            acc / count as f64
         }
     }
 
@@ -80,9 +66,10 @@ impl AhiAggregator {
         }
     }
 
-    fn record(&mut self, ts: Instant, value: f64) {
-        self.timeline.push(AhiPoint { ts, value });
-        self.prune(ts);
+    pub fn reset(&mut self, now: Instant, value: f64) {
+        self.timeline.clear();
+        self.latest_value = value;
+        self.timeline.push(AhiPoint { ts: now, value });
     }
 
     fn prune(&mut self, now: Instant) {
@@ -90,13 +77,11 @@ impl AhiAggregator {
         if self.timeline.is_empty() {
             return;
         }
-
         let first_idx = self
             .timeline
             .iter()
             .position(|point| point.ts >= cutoff)
             .unwrap_or(self.timeline.len());
-
         if first_idx > 0 {
             self.timeline.drain(0..first_idx);
         }
@@ -108,9 +93,4 @@ impl AhiAggregator {
             .rev()
             .take_while(move |point| point.ts >= cutoff)
     }
-}
-
-fn normalize_ret(ret_60s: f64) -> f64 {
-    let clipped = ret_60s.clamp(-0.2, 0.2);
-    clipped * 1_000.0
 }

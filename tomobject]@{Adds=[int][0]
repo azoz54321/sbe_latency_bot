@@ -1,0 +1,56 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'data/penalties.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/ahi.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/capital.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/clock.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/config.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/data_feed.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/execution.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/logging.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/main.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/metrics.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/mode.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/positions.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/processor.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/reset.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/rings.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/risk.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/types.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/universe.rs', LF will be replaced by CRLF the next time Git touches it
+ .gitignore                                   |   1 [32m+[m
+ Cargo.lock                                   | 120 [32m+++[m[31m-[m
+ Cargo.toml                                   |  16 [32m+[m[31m-[m
+ data/penalties.json                          |   2 [32m+[m[31m-[m
+ src/ahi.rs                                   |  50 [32m+[m[31m-[m
+ src/capital.rs                               |  43 [32m+[m[31m-[m
+ src/clock.rs                                 |  14 [32m+[m[31m-[m
+ src/config.rs                                | 127 [32m+++[m[31m-[m
+ src/data_feed.rs                             | 746 [32m+++++++++++++++[m[31m------[m
+ src/execution.rs                             | 951 [32m++++++++++++++++++[m[31m---------[m
+ src/filters.rs                               |  46 [32m+[m[31m-[m
+ src/lib.rs                                   |   9 [32m+[m[31m-[m
+ src/logging.rs                               |  57 [32m+[m[31m-[m
+ src/main.rs                                  | 311 [32m++++++++[m[31m-[m
+ src/metrics.rs                               | 118 [32m+++[m[31m-[m
+ src/mode.rs                                  |  22 [31m-[m
+ src/positions.rs                             | 235 [32m+++++[m[31m--[m
+ src/processor.rs                             | 616 [32m++++++++++++[m[31m-----[m
+ src/reset.rs                                 |  34 [32m+[m[31m-[m
+ src/rings.rs                                 |  52 [32m+[m[31m-[m
+ src/risk.rs                                  | 196 [32m+++[m[31m---[m
+ src/sbe.rs                                   | 199 [31m------[m
+ src/types.rs                                 |  19 [32m+[m
+ src/universe.rs                              | 206 [32m+++++[m[31m-[m
+ tests/e2e_auto_heal_then_success.rs          |  54 [31m--[m
+ tests/e2e_auto_heal_then_success.rs.tmp      |  58 [31m--[m
+ tests/e2e_capital_slots_positions.rs         | 115 [31m----[m
+ tests/e2e_min_notional_disables_for_today.rs |  66 [31m--[m
+ tests/e2e_reset_warmup_enable.rs             |  44 [31m--[m
+ tests/e2e_singleflight_and_token_bucket.rs   |  61 [31m--[m
+ tests/harness_smoke.rs                       |  17 [31m-[m
+ tests/support.rs                             | 763 [31m---------------------[m
+ tests/warmup_reset_exec_tests.rs             | 202 [31m------[m
+ 33 files changed, 2872 insertions(+), 2698 deletions(-)

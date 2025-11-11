@@ -1,35 +1,29 @@
 use std::collections::HashMap;
-#[cfg(feature = "test-mode")]
-use std::collections::HashSet;
 use std::fmt;
+use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-#[cfg(not(feature = "test-mode"))]
 use hmac::{Hmac, Mac};
-#[cfg(not(feature = "test-mode"))]
 use reqwest::blocking::Client;
-#[cfg(not(feature = "test-mode"))]
 use reqwest::StatusCode;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
-#[cfg(not(feature = "test-mode"))]
+use serde::Deserialize;
 use sha2::Sha256;
 
 use dashmap::DashSet;
-#[cfg(feature = "test-mode")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::affinity;
 use crate::channels::SpscReceiver;
 use crate::clock::Clock;
 use crate::config::{Config, ExecutionMode, ServerSpec};
+use crate::fees::tp_target_px;
 use crate::filters::{FilterCache, SymbolFilters};
-#[cfg(feature = "test-mode")]
-use crate::metrics::LatencyCountersSnapshot;
 use crate::metrics::LatencyMetrics;
+use crate::positions::ExitReason;
 use crate::rate_limit::TokenBucket;
 use crate::risk::{DisableReason, RiskHandle};
 
@@ -37,14 +31,17 @@ use crate::types::{
     symbol_id, LogMessage, MetricEvent, OrderIds, Symbol, SymbolId, TickToSendMetric, TriggerEvent,
 };
 
-#[cfg(not(feature = "test-mode"))]
 type HmacSha256 = Hmac<Sha256>;
+
+mod ws_orders;
+use ws_orders::WsOrderClient;
 
 const RATE_LIMIT_CAPACITY: u32 = 20;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 20.0;
 
 type ExecResult = Result<OrderIds, PlaceOrderError>;
 
+#[derive(Clone)]
 pub struct ProviderOrder {
     pub symbol: Symbol,
     pub side: &'static str,
@@ -57,8 +54,120 @@ pub struct ProviderOrder {
     pub trigger_ts_mono_ns: u64,
 }
 
+#[derive(Clone)]
+pub struct TpAdjustSpec {
+    pub min_diff_ticks: u32,
+    pub timeout: Duration,
+    pub tick_size: Decimal,
+    pub tp_pct: Decimal,
+    pub maker_fee_pct: Decimal,
+    pub taker_fee_pct: Decimal,
+    pub quantity: Decimal,
+    pub quantity_scale: u32,
+    pub price_scale: u32,
+    pub current_tp: Decimal,
+    pub client_order_id: String,
+    pub symbol: Symbol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Canceled,
+    NotFound,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    Rejected,
+    Expired,
+    Unknown,
+}
+
+impl OrderStatus {
+    fn from_str(value: &str) -> Self {
+        match value {
+            "NEW" => OrderStatus::New,
+            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+            "FILLED" => OrderStatus::Filled,
+            "CANCELED" => OrderStatus::Canceled,
+            "REJECTED" => OrderStatus::Rejected,
+            "EXPIRED" => OrderStatus::Expired,
+            _ => OrderStatus::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrderFill {
+    pub cum_filled: Decimal,
+    pub status: OrderStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderError {
+    kind: ProviderErrorKind,
+    detail: String,
+}
+
+impl ProviderError {
+    pub fn new(kind: ProviderErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn transient(detail: impl Into<String>) -> Self {
+        Self::new(ProviderErrorKind::Transient, detail)
+    }
+
+    pub fn fatal(detail: impl Into<String>) -> Self {
+        Self::new(ProviderErrorKind::Fatal, detail)
+    }
+
+    pub fn not_found(detail: impl Into<String>) -> Self {
+        Self::new(ProviderErrorKind::NotFound, detail)
+    }
+
+    pub fn is_transient(&self) -> bool {
+        matches!(self.kind, ProviderErrorKind::Transient)
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self.kind, ProviderErrorKind::NotFound)
+    }
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.detail)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Transient,
+    NotFound,
+    Fatal,
+}
+
 pub trait ExecutionProvider: Send + Sync {
+    fn submit_pair(
+        &self,
+        buy: &ProviderOrder,
+        limit: &ProviderOrder,
+        adjust: Option<TpAdjustSpec>,
+    ) -> Result<OrderIds, OrderSubmitError>;
     fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError>;
+    fn cancel_order(&self, symbol: Symbol, order_id: &str) -> Result<CancelOutcome, ProviderError>;
+    fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError>;
 }
 
 #[derive(Clone)]
@@ -244,24 +353,25 @@ pub fn spawn_execution(
     filter_cache: FilterCache,
     guards: ExecGuards,
     risk: RiskHandle,
-    #[cfg(feature = "test-mode")] provider_events: Option<Sender<ProviderEvent>>,
 ) -> (thread::JoinHandle<()>, ExecutionHandle) {
     let (cmd_tx, cmd_rx) = unbounded();
     let engine_filter_cache = filter_cache.clone();
     let engine_guards = guards.clone();
     let engine_risk = risk.clone();
-    #[cfg(feature = "test-mode")]
-    let fake_provider = Arc::new(match provider_events {
-        Some(tx) => FakeExecutionProvider::with_event_sink(clock.clone(), tx),
-        None => FakeExecutionProvider::new(clock.clone()),
-    });
-    #[cfg(feature = "test-mode")]
-    let provider: Arc<dyn ExecutionProvider> = fake_provider.clone();
-    #[cfg(not(feature = "test-mode"))]
-    let provider: Arc<dyn ExecutionProvider> =
-        Arc::new(RestExecutionProvider::new(config, clock.clone()));
+    let provider: Arc<dyn ExecutionProvider> = {
+        let rest = RestExecutionProvider::new(config, clock.clone());
+        let ws_client = WsOrderClient::spawn(
+            config,
+            clock.clone(),
+            log_tx.clone(),
+            server.execution_core,
+            cmd_tx.clone(),
+        );
+        Arc::new(WsExecutionProvider::new(rest, ws_client))
+    };
     let provider_for_engine = provider.clone();
     let clock_for_engine = clock.clone();
+    let log_tx_engine = log_tx.clone();
 
     let handle = thread::Builder::new()
         .name(format!("execution-{:?}", server.id))
@@ -271,7 +381,7 @@ pub fn spawn_execution(
                 config,
                 clock_for_engine,
                 provider_for_engine,
-                log_tx,
+                log_tx_engine,
                 cmd_rx,
                 engine_filter_cache,
                 engine_guards,
@@ -288,10 +398,13 @@ pub fn spawn_execution(
             filter_cache,
             guards,
             risk,
-            #[cfg(feature = "test-mode")]
-            fake_provider,
         },
     )
+}
+
+pub struct TargetInfo {
+    pub order_id: Option<String>,
+    pub qty: Decimal,
 }
 
 pub struct ExecutionHandle {
@@ -299,8 +412,6 @@ pub struct ExecutionHandle {
     filter_cache: FilterCache,
     guards: ExecGuards,
     risk: RiskHandle,
-    #[cfg(feature = "test-mode")]
-    fake_provider: Arc<FakeExecutionProvider>,
 }
 
 impl Clone for ExecutionHandle {
@@ -310,26 +421,10 @@ impl Clone for ExecutionHandle {
             filter_cache: self.filter_cache.clone(),
             guards: self.guards.clone(),
             risk: self.risk.clone(),
-            #[cfg(feature = "test-mode")]
-            fake_provider: self.fake_provider.clone(),
         }
     }
 }
 impl ExecutionHandle {
-    #[cfg(feature = "test-mode")]
-    pub fn fake_provider(&self) -> Arc<FakeExecutionProvider> {
-        self.fake_provider.clone()
-    }
-
-    #[cfg(feature = "test-mode")]
-    pub fn metrics_snapshot(&self) -> LatencyCountersSnapshot {
-        let (tx, rx) = bounded(1);
-        self.command_tx
-            .send(ExecutionCommand::SnapshotMetrics { tx })
-            .expect("execution command channel disconnected");
-        rx.recv().expect("metrics snapshot channel closed")
-    }
-
     pub fn reset_metrics_daily(&self) -> anyhow::Result<()> {
         let (ack_tx, ack_rx) = bounded(1);
         self.command_tx
@@ -344,15 +439,61 @@ impl ExecutionHandle {
     pub fn install_filters(&self, snapshot: HashMap<SymbolId, SymbolFilters>) {
         self.filter_cache.install(snapshot);
     }
+
+    pub fn record_limit_fill(&self, symbol: Symbol) {
+        let _ = self
+            .command_tx
+            .send(ExecutionCommand::RecordLimitFill { symbol });
+    }
+
+    pub fn submit_close_with_cancel(
+        &self,
+        symbol: Symbol,
+        expected_qty: Decimal,
+        reason: ExitReason,
+        target: TargetInfo,
+    ) -> Result<(), OrderSubmitError> {
+        let (ack_tx, ack_rx) = bounded(1);
+        self.command_tx
+            .send(ExecutionCommand::CloseWithCancel {
+                symbol,
+                expected_qty,
+                reason,
+                target,
+                ack: ack_tx,
+            })
+            .map_err(|_| {
+                OrderSubmitError::new(OrderError::Fatal, "execution command channel closed")
+            })?;
+        ack_rx.recv().unwrap_or_else(|_| {
+            Err(OrderSubmitError::new(
+                OrderError::Fatal,
+                "execution close acknowledgement failed",
+            ))
+        })
+    }
 }
 
 enum ExecutionCommand {
     ResetDaily {
         ack: Sender<()>,
     },
-    #[cfg(feature = "test-mode")]
-    SnapshotMetrics {
-        tx: Sender<LatencyCountersSnapshot>,
+    RecordLimitFill {
+        symbol: Symbol,
+    },
+    CloseWithCancel {
+        symbol: Symbol,
+        expected_qty: Decimal,
+        reason: ExitReason,
+        target: TargetInfo,
+        ack: Sender<Result<(), OrderSubmitError>>,
+    },
+    TpAdjust {
+        symbol: Symbol,
+        old_order_id: String,
+        new_order_id: String,
+        new_price: Decimal,
+        ticks_diff: u32,
     },
 }
 
@@ -367,6 +508,8 @@ struct ExecutionEngine {
     metrics: LatencyMetrics,
     command_rx: Receiver<ExecutionCommand>,
     provider: Arc<dyn ExecutionProvider>,
+    open_limits: HashMap<Symbol, Option<String>>,
+    target_notional: Decimal,
 }
 
 impl ExecutionEngine {
@@ -384,6 +527,8 @@ impl ExecutionEngine {
         let metrics = LatencyMetrics::new(config.strategy.enable_metrics_test_only, clock.clone());
 
         let latency_budget_ns = config.trigger.latency_budget.as_nanos() as u64;
+        let target_notional =
+            Decimal::from_f64(config.execution.order_quote_size_usdt).unwrap_or(Decimal::ZERO);
 
         let engine = Self {
             config,
@@ -396,10 +541,10 @@ impl ExecutionEngine {
             metrics,
             command_rx,
             provider,
+            open_limits: HashMap::new(),
+            target_notional,
         };
-        let _ = engine
-            .log_tx
-            .send(LogMessage::Info("[BOOT] execution runtime ready".into()));
+        tracing::debug!(target: "bot", "[BOOT] execution runtime ready");
         engine
     }
 
@@ -423,13 +568,250 @@ impl ExecutionEngine {
         match command {
             ExecutionCommand::ResetDaily { ack } => {
                 self.metrics.reset_daily();
+                self.open_limits.clear();
                 let _ = ack.send(());
             }
-            #[cfg(feature = "test-mode")]
-            ExecutionCommand::SnapshotMetrics { tx } => {
-                let _ = tx.send(self.metrics.counters_snapshot());
+            ExecutionCommand::RecordLimitFill { symbol } => {
+                self.record_limit_fill(symbol);
+            }
+            ExecutionCommand::CloseWithCancel {
+                symbol,
+                expected_qty,
+                reason,
+                target,
+                ack,
+            } => {
+                let result = self.handle_close_with_cancel(symbol, expected_qty, reason, target);
+                let _ = ack.send(result);
+            }
+            ExecutionCommand::TpAdjust {
+                symbol,
+                old_order_id,
+                new_order_id,
+                new_price,
+                ticks_diff,
+            } => {
+                self.handle_tp_adjust(symbol, old_order_id, new_order_id, new_price, ticks_diff);
             }
         }
+    }
+
+    fn record_limit_fill(&mut self, symbol: Symbol) {
+        self.open_limits.remove(&symbol);
+        self.metrics.inc_exit_limit_tp();
+        self.metrics.maybe_flush();
+    }
+
+    fn handle_tp_adjust(
+        &mut self,
+        symbol: Symbol,
+        old_order_id: String,
+        new_order_id: String,
+        _new_price: Decimal,
+        ticks_diff: u32,
+    ) {
+        self.open_limits.insert(symbol, Some(new_order_id.clone()));
+
+        let slot_label = slot_from_client_id(&new_order_id)
+            .or_else(|| slot_from_client_id(&old_order_id))
+            .unwrap_or_else(|| "NA".to_string());
+        let _ = self.log_tx.send(LogMessage::Info(
+            format!(
+                "[TP_ADJUST] sym={} old={} new={} ticks={} slot={}",
+                symbol, old_order_id, new_order_id, ticks_diff, slot_label
+            )
+            .into(),
+        ));
+    }
+
+    fn handle_close_with_cancel(
+        &mut self,
+        symbol: Symbol,
+        expected_qty: Decimal,
+        reason: ExitReason,
+        target: TargetInfo,
+    ) -> Result<(), OrderSubmitError> {
+        let mut remaining = if expected_qty > Decimal::ZERO {
+            expected_qty
+        } else {
+            Decimal::ZERO
+        };
+
+        if let Some(ref order_id) = target.order_id {
+            self.metrics.inc_cancel_attempts();
+
+            let cancel_once = |engine: &mut ExecutionEngine| -> Result<(), ProviderError> {
+                match engine.provider.cancel_order(symbol, order_id) {
+                    Ok(CancelOutcome::Canceled) => {
+                        engine.metrics.inc_cancel_success();
+                        Ok(())
+                    }
+                    Ok(CancelOutcome::NotFound) => {
+                        engine.metrics.inc_cancel_not_found();
+                        Ok(())
+                    }
+                    Ok(CancelOutcome::Unknown) => {
+                        engine.metrics.inc_cancel_failed();
+                        Ok(())
+                    }
+                    Err(err) => {
+                        if err.is_transient() {
+                            return Err(err);
+                        }
+                        if err.is_not_found() {
+                            engine.metrics.inc_cancel_not_found();
+                        } else {
+                            engine.metrics.inc_cancel_failed();
+                        }
+                        Ok(())
+                    }
+                }
+            };
+
+            if cancel_once(self).is_err() {
+                thread::sleep(Duration::from_millis(40));
+                let _ = cancel_once(self);
+            }
+
+            if let Ok(fill) = self.provider.query_order(symbol, order_id) {
+                let filled = if fill.cum_filled > Decimal::ZERO {
+                    fill.cum_filled
+                } else {
+                    Decimal::ZERO
+                };
+                let mut rem = if target.qty > filled {
+                    target.qty - filled
+                } else {
+                    Decimal::ZERO
+                };
+                if rem < Decimal::ZERO {
+                    rem = Decimal::ZERO;
+                }
+                let extra = if expected_qty > target.qty {
+                    expected_qty - target.qty
+                } else {
+                    Decimal::ZERO
+                };
+                let mut candidate = rem + extra;
+                if candidate < Decimal::ZERO {
+                    candidate = Decimal::ZERO;
+                }
+                if candidate < remaining {
+                    remaining = candidate;
+                }
+            }
+        }
+
+        self.open_limits.remove(&symbol);
+
+        let symbol_id = symbol_id(symbol);
+        let filters = self.filter_cache.get(symbol_id).ok_or_else(|| {
+            OrderSubmitError::new(
+                OrderError::Fatal,
+                format!("filters unavailable for {}", symbol),
+            )
+        })?;
+
+        let aligned_qty = floor_to_step(remaining, filters.step);
+        if aligned_qty <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        if filters.min_notional > Decimal::ZERO {
+            let approx_notional = self.approx_close_notional(aligned_qty, &target);
+            if approx_notional > Decimal::ZERO && approx_notional < filters.min_notional {
+                return Ok(());
+            }
+        }
+
+        self.submit_market_close(symbol, filters, aligned_qty, reason)
+    }
+
+    fn submit_market_close(
+        &mut self,
+        symbol: Symbol,
+        filters: SymbolFilters,
+        quantity: Decimal,
+        reason: ExitReason,
+    ) -> Result<(), OrderSubmitError> {
+        let symbol_id = symbol_id(symbol);
+        let _permit = self.guards.enter(symbol_id).map_err(|err| match err {
+            GuardError::RateLimited => OrderSubmitError::new(
+                OrderError::Transient,
+                format!("rate limited closing order for {}", symbol),
+            ),
+            GuardError::InFlight => OrderSubmitError::new(
+                OrderError::Transient,
+                format!("close already in-flight for {}", symbol),
+            ),
+        })?;
+
+        if quantity <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let qty_scale = filters.step.scale();
+        let price_scale = filters.tick.scale();
+        let now_ns = self.clock.monotonic_now_ns();
+
+        self.provider.submit_order(&ProviderOrder {
+            symbol,
+            side: "SELL",
+            order_type: "MARKET",
+            quantity,
+            quantity_scale: qty_scale,
+            price: None,
+            price_scale,
+            client_order_id: format!("CLOSE-{}-{}", symbol, now_ns),
+            trigger_ts_mono_ns: now_ns,
+        })?;
+
+        let qty_str = format_decimal(quantity, qty_scale);
+        let reason_label = match reason {
+            ExitReason::StopLoss => {
+                self.metrics.inc_exit_market_sl();
+                "stop"
+            }
+            ExitReason::ReturnToEntry => {
+                self.metrics.inc_exit_market_bounce();
+                "bounce"
+            }
+            ExitReason::TakeProfitLimit => {
+                self.metrics.inc_exit_limit_tp();
+                "tp"
+            }
+        };
+
+        let _ = self.log_tx.send(LogMessage::Info(
+            format!(
+                "[SELL] market close reason={reason_label} {} qty={qty_str}",
+                symbol
+            )
+            .into(),
+        ));
+
+        self.metrics.maybe_flush();
+        Ok(())
+    }
+
+    fn approx_close_notional(&self, qty: Decimal, target: &TargetInfo) -> Decimal {
+        if qty <= Decimal::ZERO || self.target_notional <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        if target.qty <= Decimal::ZERO {
+            return self.target_notional;
+        }
+
+        let mut ratio = qty / target.qty;
+        if ratio < Decimal::ZERO {
+            ratio = Decimal::ZERO;
+        }
+        if ratio > Decimal::ONE {
+            ratio = Decimal::ONE;
+        }
+
+        (self.target_notional * ratio).normalize()
     }
 
     fn handle_trigger(&mut self, trigger: TriggerEvent) {
@@ -454,6 +836,8 @@ impl ExecutionEngine {
 
         match result {
             Ok(order_ids) => {
+                self.open_limits
+                    .insert(trigger.symbol, order_ids.limit.clone());
                 let send_ns = self.clock.monotonic_now_ns();
                 let _ = self.log_tx.send(
                     MetricEvent::BuyOk {
@@ -478,7 +862,7 @@ impl ExecutionEngine {
                         send_ns.saturating_sub(trigger.signal_ts_mono_ns),
                     ));
                 }
-                self.metrics.maybe_flush(&self.log_tx);
+                self.metrics.maybe_flush();
             }
             Err(err) => match err {
                 PlaceOrderError::Guard(GuardError::RateLimited) => {
@@ -576,9 +960,7 @@ impl ExecutionEngine {
                     if auto_heal_used {
                         self.metrics.inc_auto_heal_success();
                         if self.config.strategy.enable_metrics_test_only {
-                            let _ = self.log_tx.send(LogMessage::Info(
-                                format!("[HEAL] success {}", symbol).into(),
-                            ));
+                            tracing::debug!(target: "bot", "[HEAL] success {}", symbol);
                         }
                     }
 
@@ -605,9 +987,7 @@ impl ExecutionEngine {
                             self.metrics.inc_auto_heal_attempts();
                             auto_heal_used = true;
                             if self.config.strategy.enable_metrics_test_only {
-                                let _ = self.log_tx.send(LogMessage::Info(
-                                    format!("[HEAL] refresh {}", symbol).into(),
-                                ));
+                                tracing::debug!(target: "bot", "[HEAL] refresh {}", symbol);
                             }
                             match self.filter_cache.refresh_symbol(symbol.as_str()) {
                                 Ok(updated) => {
@@ -673,46 +1053,72 @@ impl ExecutionEngine {
             )));
         }
 
-        let tp_multiplier = Decimal::from_i128_with_scale(110, 2);
-        let tp_price = align_tick_up(price_now * tp_multiplier, filters.tick);
+        let tp_price = align_tick_up(
+            tp_target_px(
+                price_now,
+                self.config.strategy.tp_pct,
+                self.config.strategy.maker_fee_pct,
+                self.config.strategy.taker_fee_pct,
+            ),
+            filters.tick,
+        );
         let qty_scale = filters.step.scale();
         let price_scale = filters.tick.scale();
 
-        let buy_order = self
-            .provider
-            .submit_order(&ProviderOrder {
-                symbol,
-                side: "BUY",
-                order_type: "MARKET",
-                quantity: qty,
-                quantity_scale: qty_scale,
-                price: None,
-                price_scale,
-                client_order_id: format!("BUY-{}-{}", symbol, trigger.trigger_ts_mono_ns),
-                trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
-            })
-            .map_err(PlaceOrderError::Order)?;
+        let buy_order = ProviderOrder {
+            symbol,
+            side: "BUY",
+            order_type: "MARKET",
+            quantity: qty,
+            quantity_scale: qty_scale,
+            price: None,
+            price_scale,
+            client_order_id: format!(
+                "{}-buy-{}",
+                trigger.slot.label(),
+                trigger.trigger_ts_mono_ns
+            ),
+            trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
+        };
 
-        let limit_order = self
-            .provider
-            .submit_order(&ProviderOrder {
-                symbol,
-                side: "SELL",
-                order_type: "LIMIT",
+        let limit_order = ProviderOrder {
+            symbol,
+            side: "SELL",
+            order_type: "LIMIT",
+            quantity: qty,
+            quantity_scale: qty_scale,
+            price: Some(tp_price),
+            price_scale,
+            client_order_id: format!("{}-tp-{}", trigger.slot.label(), trigger.trigger_ts_mono_ns),
+            trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
+        };
+
+        let adjust_spec = if self.config.tp_adjust.enabled {
+            Some(TpAdjustSpec {
+                min_diff_ticks: self.config.tp_adjust.min_diff_ticks,
+                timeout: self.config.tp_adjust.timeout,
+                tick_size: filters.tick,
+                tp_pct: self.config.strategy.tp_pct,
+                maker_fee_pct: self.config.strategy.maker_fee_pct,
+                taker_fee_pct: self.config.strategy.taker_fee_pct,
                 quantity: qty,
                 quantity_scale: qty_scale,
-                price: Some(tp_price),
                 price_scale,
-                client_order_id: format!("SELL-{}-{}", symbol, trigger.trigger_ts_mono_ns),
-                trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
+                current_tp: tp_price,
+                client_order_id: limit_order.client_order_id.clone(),
+                symbol,
             })
+        } else {
+            None
+        };
+
+        let ids = self
+            .provider
+            .submit_pair(&buy_order, &limit_order, adjust_spec)
             .map_err(PlaceOrderError::Order)?;
 
         Ok(OrderAttempt {
-            ids: OrderIds {
-                buy: Some(buy_order),
-                limit: Some(limit_order),
-            },
+            ids,
             qty,
             tp_price,
             qty_scale,
@@ -726,6 +1132,7 @@ impl ExecutionEngine {
         let reason_label = match reason {
             DisableReason::OrderReject => "OrderReject",
             DisableReason::FatalError => "FatalError",
+            DisableReason::DailyLoss => "DailyLoss",
         };
         let _ = self.log_tx.send(LogMessage::Warn(
             format!("[RISK] disabled symbol={} reason={reason_label}", symbol).into(),
@@ -749,6 +1156,10 @@ fn align_tick_up(price: Decimal, tick: Decimal) -> Decimal {
     (steps * tick).normalize()
 }
 
+fn slot_from_client_id(client_id: &str) -> Option<String> {
+    client_id.split('-').next().map(|value| value.to_string())
+}
+
 fn format_decimal(value: Decimal, decimals: u32) -> String {
     value
         .round_dp_with_strategy(decimals, rust_decimal::RoundingStrategy::ToZero)
@@ -764,7 +1175,6 @@ struct OrderAttempt {
     price_scale: u32,
 }
 
-#[cfg(not(feature = "test-mode"))]
 fn classify_order_error(status: StatusCode, body: &str) -> OrderError {
     let upper = body.to_ascii_uppercase();
     if upper.contains("PRICE_FILTER") {
@@ -788,14 +1198,33 @@ fn classify_order_error(status: StatusCode, body: &str) -> OrderError {
 
     OrderError::Fatal
 }
-#[cfg(not(feature = "test-mode"))]
+
+fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
+    if err.is_timeout() || err.is_connect() {
+        ProviderError::transient(err.to_string())
+    } else {
+        ProviderError::fatal(err.to_string())
+    }
+}
+
+fn is_unknown_order(body: &str) -> bool {
+    body.to_ascii_uppercase().contains("UNKNOWN_ORDER")
+}
 struct RestExecutionProvider {
     config: &'static Config,
     client: Client,
     clock: Arc<dyn Clock>,
 }
 
-#[cfg(not(feature = "test-mode"))]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestQueryOrderResponse {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    executed_qty: String,
+}
+
 impl RestExecutionProvider {
     #[allow(clippy::too_many_arguments)]
     fn new(config: &'static Config, clock: Arc<dyn Clock>) -> Self {
@@ -819,10 +1248,61 @@ impl RestExecutionProvider {
         mac.update(payload.as_bytes());
         Ok(hex::encode(mac.finalize().into_bytes()))
     }
+
+    fn sign_payload_provider(&self, payload: &str) -> Result<String, ProviderError> {
+        self.sign_payload(payload)
+            .map_err(|err| ProviderError::fatal(err.to_string()))
+    }
+
+    fn signed_order_url(&self, symbol: Symbol, order_id: &str) -> Result<String, ProviderError> {
+        let recv_window = self.config.execution.recv_window_ms;
+        let timestamp_ms = self.clock.unix_now_ns() / 1_000_000;
+        let payload = format!(
+            "symbol={symbol}&origClientOrderId={order_id}&recvWindow={recv_window}&timestamp={timestamp}",
+            symbol = symbol.as_str(),
+            order_id = order_id,
+            recv_window = recv_window,
+            timestamp = timestamp_ms,
+        );
+        let signature = self.sign_payload_provider(&payload)?;
+        Ok(format!(
+            "{base}/api/v3/order?{payload}&signature={signature}",
+            base = self.config.transport.rest_base_url,
+            payload = payload,
+            signature = signature,
+        ))
+    }
+
+    fn http_error(&self, op: &str, status: StatusCode, body: String) -> ProviderError {
+        let detail = format!("[REST] {op} status={status} body={body}");
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::SERVICE_UNAVAILABLE
+            || status == StatusCode::GATEWAY_TIMEOUT
+            || status == StatusCode::REQUEST_TIMEOUT
+            || status.is_server_error()
+        {
+            ProviderError::transient(detail)
+        } else {
+            ProviderError::fatal(detail)
+        }
+    }
 }
 
-#[cfg(not(feature = "test-mode"))]
 impl ExecutionProvider for RestExecutionProvider {
+    fn submit_pair(
+        &self,
+        buy: &ProviderOrder,
+        limit: &ProviderOrder,
+        _adjust: Option<TpAdjustSpec>,
+    ) -> Result<OrderIds, OrderSubmitError> {
+        let buy_id = self.submit_order(buy)?;
+        let limit_id = self.submit_order(limit)?;
+        Ok(OrderIds {
+            buy: Some(buy_id),
+            limit: Some(limit_id),
+        })
+    }
+
     fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError> {
         let api_key = self.config.credentials.rest_api_key;
         let endpoint = format!("{}/api/v3/order", self.config.transport.rest_base_url);
@@ -879,245 +1359,86 @@ impl ExecutionProvider for RestExecutionProvider {
             format!("binance rejected order: status={status} body={body}"),
         ))
     }
-}
 
-#[cfg(feature = "test-mode")]
-pub struct FakeExecutionProvider {
-    _clock: Arc<dyn Clock>,
-    behaviors: Mutex<HashMap<Symbol, FakeBehaviorState>>,
-    calls: Mutex<Vec<ProviderCall>>,
-    active: Mutex<HashSet<Symbol>>,
-    overlap: AtomicBool,
-    events_tx: Sender<ProviderEvent>,
-    events_rx: Option<Receiver<ProviderEvent>>,
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Debug, Clone, Copy)]
-pub enum FakeOrderBehavior {
-    AlwaysOk,
-    RejectLimitOnce(OrderError),
-    RejectBuyOnce(OrderError),
-    Always(OrderError),
-    TransientOnce,
-    FatalOnce,
-    SlowSuccess { spins: usize },
-}
-
-#[cfg(feature = "test-mode")]
-impl FakeExecutionProvider {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
-        let (events_tx, events_rx) = unbounded();
-        Self::with_parts(clock, events_tx, Some(events_rx))
-    }
-
-    pub fn with_event_sink(clock: Arc<dyn Clock>, tx: Sender<ProviderEvent>) -> Self {
-        Self::with_parts(clock, tx, None)
-    }
-
-    fn with_parts(
-        clock: Arc<dyn Clock>,
-        events_tx: Sender<ProviderEvent>,
-        events_rx: Option<Receiver<ProviderEvent>>,
-    ) -> Self {
-        Self {
-            _clock: clock,
-            behaviors: Mutex::new(HashMap::new()),
-            calls: Mutex::new(Vec::new()),
-            active: Mutex::new(HashSet::new()),
-            overlap: AtomicBool::new(false),
-            events_tx,
-            events_rx,
+    fn cancel_order(&self, symbol: Symbol, order_id: &str) -> Result<CancelOutcome, ProviderError> {
+        let url = self.signed_order_url(symbol, order_id)?;
+        let response = self
+            .client
+            .delete(&url)
+            .header("X-MBX-APIKEY", self.config.credentials.rest_api_key)
+            .send()
+            .map_err(map_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(CancelOutcome::Canceled);
         }
-    }
-
-    pub fn set_behavior(&self, symbol: Symbol, behavior: FakeOrderBehavior) {
-        let mut map = self.behaviors.lock().expect("fake provider poisoned");
-        let state = match behavior {
-            FakeOrderBehavior::AlwaysOk => FakeBehaviorState::AlwaysOk,
-            FakeOrderBehavior::RejectLimitOnce(error) => {
-                FakeBehaviorState::RejectLimitOnce { error, used: false }
-            }
-            FakeOrderBehavior::RejectBuyOnce(error) => {
-                FakeBehaviorState::RejectBuyOnce { error, used: false }
-            }
-            FakeOrderBehavior::Always(error) => FakeBehaviorState::AlwaysReject { error },
-            FakeOrderBehavior::TransientOnce => FakeBehaviorState::TransientOnce { used: false },
-            FakeOrderBehavior::FatalOnce => FakeBehaviorState::FatalOnce { used: false },
-            FakeOrderBehavior::SlowSuccess { spins } => FakeBehaviorState::SlowSuccess { spins },
-        };
-        map.insert(symbol, state);
-    }
-
-    pub fn reset(&self) {
-        self.behaviors
-            .lock()
-            .expect("fake provider poisoned")
-            .clear();
-        self.clear_calls();
-        self.active.lock().expect("fake provider poisoned").clear();
-        self.overlap.store(false, Ordering::SeqCst);
-    }
-
-    pub fn clear_calls(&self) {
-        self.calls.lock().expect("fake provider poisoned").clear();
-        self.overlap.store(false, Ordering::SeqCst);
-        if let Some(rx) = &self.events_rx {
-            while rx.try_recv().is_ok() {}
+        let body = response.text().unwrap_or_default();
+        if status == StatusCode::NOT_FOUND || is_unknown_order(&body) {
+            return Ok(CancelOutcome::NotFound);
         }
+        Err(self.http_error("cancel", status, body))
     }
 
-    pub fn drain_calls(&self) -> Vec<ProviderCall> {
-        let mut calls = self.calls.lock().expect("fake provider poisoned");
-        let drained = calls.clone();
-        calls.clear();
-        drained
-    }
-
-    pub fn snapshot_calls(&self) -> Vec<ProviderCall> {
-        self.calls.lock().expect("fake provider poisoned").clone()
-    }
-
-    pub fn overlap_detected(&self) -> bool {
-        self.overlap.load(Ordering::SeqCst)
-    }
-
-    fn emit(&self, event: ProviderEvent) {
-        let _ = self.events_tx.send(event);
-    }
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Debug, Clone)]
-enum FakeBehaviorState {
-    AlwaysOk,
-    RejectLimitOnce { error: OrderError, used: bool },
-    RejectBuyOnce { error: OrderError, used: bool },
-    AlwaysReject { error: OrderError },
-    TransientOnce { used: bool },
-    FatalOnce { used: bool },
-    SlowSuccess { spins: usize },
-}
-
-#[cfg(feature = "test-mode")]
-impl FakeBehaviorState {
-    fn apply(&mut self, order: &ProviderOrder) -> Result<String, OrderSubmitError> {
-        match self {
-            FakeBehaviorState::AlwaysOk => Ok(order.client_order_id.clone()),
-            FakeBehaviorState::RejectLimitOnce { error, used } => {
-                if order.order_type == "LIMIT" && !*used {
-                    *used = true;
-                    Err(OrderSubmitError::new(
-                        *error,
-                        format!("fake limit reject {:?} {}", error, order.symbol),
-                    ))
-                } else {
-                    Ok(order.client_order_id.clone())
-                }
-            }
-            FakeBehaviorState::RejectBuyOnce { error, used } => {
-                if order.side == "BUY" && !*used {
-                    *used = true;
-                    Err(OrderSubmitError::new(
-                        *error,
-                        format!("fake buy reject {:?} {}", error, order.symbol),
-                    ))
-                } else {
-                    Ok(order.client_order_id.clone())
-                }
-            }
-            FakeBehaviorState::AlwaysReject { error } => Err(OrderSubmitError::new(
-                *error,
-                format!("fake permanent reject {:?} {}", error, order.symbol),
-            )),
-            FakeBehaviorState::TransientOnce { used } => {
-                if !*used {
-                    *used = true;
-                    Err(OrderSubmitError::new(
-                        OrderError::Transient,
-                        format!("fake transient failure for {}", order.symbol),
-                    ))
-                } else {
-                    Ok(order.client_order_id.clone())
-                }
-            }
-            FakeBehaviorState::FatalOnce { used } => {
-                if !*used {
-                    *used = true;
-                    Err(OrderSubmitError::new(
-                        OrderError::Fatal,
-                        format!("fake fatal failure for {}", order.symbol),
-                    ))
-                } else {
-                    Ok(order.client_order_id.clone())
-                }
-            }
-            FakeBehaviorState::SlowSuccess { spins } => {
-                for _ in 0..*spins {
-                    std::hint::spin_loop();
-                }
-                Ok(order.client_order_id.clone())
-            }
-        }
-    }
-}
-
-#[cfg(feature = "test-mode")]
-impl ExecutionProvider for FakeExecutionProvider {
-    fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError> {
-        {
-            let mut active = self.active.lock().expect("fake provider poisoned");
-            if !active.insert(order.symbol) {
-                self.overlap.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let mut map = self.behaviors.lock().expect("fake provider poisoned");
-        let state = map
-            .entry(order.symbol)
-            .or_insert(FakeBehaviorState::AlwaysOk);
-        let result = state.apply(order);
-        drop(map);
-
-        {
-            let mut active = self.active.lock().expect("fake provider poisoned");
-            active.remove(&order.symbol);
-        }
-
-        {
-            let mut calls = self.calls.lock().expect("fake provider poisoned");
-            calls.push(ProviderCall {
-                symbol: order.symbol,
-                side: order.side,
-                order_type: order.order_type,
-                success: result.is_ok(),
+    fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError> {
+        let url = self.signed_order_url(symbol, order_id)?;
+        let response = self
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", self.config.credentials.rest_api_key)
+            .send()
+            .map_err(map_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            let payload: RestQueryOrderResponse = response
+                .json()
+                .map_err(|err| ProviderError::fatal(err.to_string()))?;
+            let qty = Decimal::from_str(&payload.executed_qty).unwrap_or(Decimal::ZERO);
+            return Ok(OrderFill {
+                cum_filled: qty,
+                status: OrderStatus::from_str(&payload.status),
             });
         }
-
-        let sym_id = symbol_id(order.symbol);
-        let event = if order.order_type == "LIMIT" {
-            ProviderEvent::Limit { sym: sym_id }
-        } else {
-            ProviderEvent::Buy { sym: sym_id }
-        };
-        self.emit(event);
-
-        result
+        let body = response.text().unwrap_or_default();
+        if status == StatusCode::NOT_FOUND || is_unknown_order(&body) {
+            return Err(ProviderError::not_found(format!(
+                "order not found {} {}",
+                symbol, order_id
+            )));
+        }
+        Err(self.http_error("query", status, body))
     }
 }
 
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug)]
-pub struct ProviderCall {
-    pub symbol: Symbol,
-    pub side: &'static str,
-    pub order_type: &'static str,
-    pub success: bool,
+struct WsExecutionProvider {
+    rest: RestExecutionProvider,
+    ws: WsOrderClient,
 }
 
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug)]
-pub enum ProviderEvent {
-    Buy { sym: SymbolId },
-    Limit { sym: SymbolId },
+impl WsExecutionProvider {
+    fn new(rest: RestExecutionProvider, ws: WsOrderClient) -> Self {
+        Self { rest, ws }
+    }
+}
+
+impl ExecutionProvider for WsExecutionProvider {
+    fn submit_pair(
+        &self,
+        buy: &ProviderOrder,
+        limit: &ProviderOrder,
+        adjust: Option<TpAdjustSpec>,
+    ) -> Result<OrderIds, OrderSubmitError> {
+        self.ws.place_pair(buy.clone(), limit.clone(), adjust)
+    }
+
+    fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError> {
+        self.rest.submit_order(order)
+    }
+
+    fn cancel_order(&self, symbol: Symbol, order_id: &str) -> Result<CancelOutcome, ProviderError> {
+        self.rest.cancel_order(symbol, order_id)
+    }
+
+    fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError> {
+        self.rest.query_order(symbol, order_id)
+    }
 }

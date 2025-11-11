@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerSpec};
 use crate::types::{LogMessage, MetricEvent, Symbol, TickToSendMetric};
@@ -35,7 +35,7 @@ struct LogAggregator {
 
 impl LogAggregator {
     fn new(config: &'static Config, server: &'static ServerSpec, rx: Receiver<LogMessage>) -> Self {
-        info!(
+        debug!(
             target: "bot",
             "log aggregator ready: active_server={:?} log_flush={}ms",
             server.id,
@@ -130,6 +130,13 @@ struct Stats {
     last_trigger_emitted: Option<Symbol>,
     last_buy_ok: Option<Symbol>,
     last_signal_suppressed: Option<Symbol>,
+    risk_freeze_daily_loss: u64,
+    bans_created_30d: u64,
+    deny_rebuy_today: u64,
+    deny_haram: u64,
+    last_risk_ban: Option<Symbol>,
+    last_deny_rebuy: Option<Symbol>,
+    last_deny_haram: Option<Symbol>,
 }
 
 impl Stats {
@@ -157,6 +164,13 @@ impl Stats {
         self.last_trigger_emitted = None;
         self.last_buy_ok = None;
         self.last_signal_suppressed = None;
+        self.risk_freeze_daily_loss = 0;
+        self.bans_created_30d = 0;
+        self.deny_rebuy_today = 0;
+        self.deny_haram = 0;
+        self.last_risk_ban = None;
+        self.last_deny_rebuy = None;
+        self.last_deny_haram = None;
     }
 
     fn apply(&mut self, event: MetricEvent) {
@@ -201,6 +215,21 @@ impl Stats {
             MetricEvent::SignalSuppressed { symbol } => {
                 self.signal_suppressed += 1;
                 self.last_signal_suppressed = Some(symbol);
+            }
+            MetricEvent::RiskFreezeDailyLoss => {
+                self.risk_freeze_daily_loss += 1;
+            }
+            MetricEvent::RiskBanCreated { symbol } => {
+                self.bans_created_30d += 1;
+                self.last_risk_ban = Some(symbol);
+            }
+            MetricEvent::RiskDenyRebuyToday { symbol } => {
+                self.deny_rebuy_today += 1;
+                self.last_deny_rebuy = Some(symbol);
+            }
+            MetricEvent::RiskDenyHaram { symbol } => {
+                self.deny_haram += 1;
+                self.last_deny_haram = Some(symbol);
             }
         }
     }
@@ -271,6 +300,30 @@ impl Stats {
             notes.push(format!("last_signal_suppressed={}", symbol));
         }
 
+        if self.risk_freeze_daily_loss > 0 {
+            notes.push(format!(
+                "risk_freeze_daily_loss={}",
+                self.risk_freeze_daily_loss
+            ));
+        }
+        if self.bans_created_30d > 0 {
+            notes.push(format!("bans_created_30d={}", self.bans_created_30d));
+            if let Some(symbol) = self.last_risk_ban {
+                notes.push(format!("last_ban={}", symbol));
+            }
+        }
+        if self.deny_rebuy_today > 0 {
+            notes.push(format!("deny_rebuy_today={}", self.deny_rebuy_today));
+            if let Some(symbol) = self.last_deny_rebuy {
+                notes.push(format!("last_deny_rebuy={}", symbol));
+            }
+        }
+        if self.deny_haram > 0 {
+            notes.push(format!("deny_haram={}", self.deny_haram));
+            if let Some(symbol) = self.last_deny_haram {
+                notes.push(format!("last_deny_haram={}", symbol));
+            }
+        }
         if notes.is_empty() {
             String::new()
         } else {

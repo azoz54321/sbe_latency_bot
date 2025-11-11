@@ -1,10 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
-
 use crate::clock::Clock;
-use crate::types::LogMessage;
 
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -18,6 +15,13 @@ pub struct LatencyMetrics {
     auto_heal_attempts: u64,
     auto_heal_success: u64,
     disable_for_today: u64,
+    exit_limit_tp: u64,
+    exit_market_sl: u64,
+    exit_market_bounce: u64,
+    cancel_attempts: u64,
+    cancel_success: u64,
+    cancel_not_found: u64,
+    cancel_failed: u64,
     clock: Arc<dyn Clock>,
 }
 
@@ -33,6 +37,13 @@ impl LatencyMetrics {
             auto_heal_attempts: 0,
             auto_heal_success: 0,
             disable_for_today: 0,
+            exit_limit_tp: 0,
+            exit_market_sl: 0,
+            exit_market_bounce: 0,
+            cancel_attempts: 0,
+            cancel_success: 0,
+            cancel_not_found: 0,
+            cancel_failed: 0,
             clock,
         }
     }
@@ -73,7 +84,49 @@ impl LatencyMetrics {
         }
     }
 
-    pub fn maybe_flush(&mut self, log_tx: &Sender<LogMessage>) {
+    pub fn inc_exit_limit_tp(&mut self) {
+        if self.enabled {
+            self.exit_limit_tp = self.exit_limit_tp.saturating_add(1);
+        }
+    }
+
+    pub fn inc_exit_market_sl(&mut self) {
+        if self.enabled {
+            self.exit_market_sl = self.exit_market_sl.saturating_add(1);
+        }
+    }
+
+    pub fn inc_exit_market_bounce(&mut self) {
+        if self.enabled {
+            self.exit_market_bounce = self.exit_market_bounce.saturating_add(1);
+        }
+    }
+
+    pub fn inc_cancel_attempts(&mut self) {
+        if self.enabled {
+            self.cancel_attempts = self.cancel_attempts.saturating_add(1);
+        }
+    }
+
+    pub fn inc_cancel_success(&mut self) {
+        if self.enabled {
+            self.cancel_success = self.cancel_success.saturating_add(1);
+        }
+    }
+
+    pub fn inc_cancel_not_found(&mut self) {
+        if self.enabled {
+            self.cancel_not_found = self.cancel_not_found.saturating_add(1);
+        }
+    }
+
+    pub fn inc_cancel_failed(&mut self) {
+        if self.enabled {
+            self.cancel_failed = self.cancel_failed.saturating_add(1);
+        }
+    }
+
+    pub fn maybe_flush(&mut self) {
         if !self.enabled {
             return;
         }
@@ -101,16 +154,39 @@ impl LatencyMetrics {
             if self.auto_heal_attempts > 0
                 || self.auto_heal_success > 0
                 || self.disable_for_today > 0
+                || self.exit_limit_tp > 0
+                || self.exit_market_sl > 0
+                || self.exit_market_bounce > 0
+                || self.cancel_attempts > 0
+                || self.cancel_success > 0
+                || self.cancel_not_found > 0
+                || self.cancel_failed > 0
             {
                 message.push_str(&format!(
-                    " heal_attempts={} heal_success={} disables={}",
-                    self.auto_heal_attempts, self.auto_heal_success, self.disable_for_today
-                ));
+                " heal_attempts={} heal_success={} disables={} exit_tp={} exit_sl={} exit_bounce={} cancel_attempts={} cancel_success={} cancel_not_found={} cancel_failed={}",
+                self.auto_heal_attempts,
+                self.auto_heal_success,
+                self.disable_for_today,
+                self.exit_limit_tp,
+                self.exit_market_sl,
+                self.exit_market_bounce,
+                self.cancel_attempts,
+                self.cancel_success,
+                self.cancel_not_found,
+                self.cancel_failed
+            ));
             }
-            let _ = log_tx.send(LogMessage::Info(message.into()));
+            tracing::debug!(target: "bot", "{}", message);
             self.auto_heal_attempts = 0;
             self.auto_heal_success = 0;
             self.disable_for_today = 0;
+            self.exit_limit_tp = 0;
+            self.exit_market_sl = 0;
+            self.exit_market_bounce = 0;
+            self.cancel_attempts = 0;
+            self.cancel_success = 0;
+            self.cancel_not_found = 0;
+            self.cancel_failed = 0;
         }
     }
 
@@ -125,6 +201,13 @@ impl LatencyMetrics {
         self.auto_heal_attempts = 0;
         self.auto_heal_success = 0;
         self.disable_for_today = 0;
+        self.exit_limit_tp = 0;
+        self.exit_market_sl = 0;
+        self.exit_market_bounce = 0;
+        self.cancel_attempts = 0;
+        self.cancel_success = 0;
+        self.cancel_not_found = 0;
+        self.cancel_failed = 0;
     }
 
     fn take_snapshot(&mut self) -> Option<LatencySnapshot> {
@@ -201,23 +284,4 @@ struct LatencySnapshot {
 
 fn micros_to_ms(value: u64) -> f64 {
     value as f64 / 1_000.0
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LatencyCountersSnapshot {
-    pub auto_heal_attempts: u64,
-    pub auto_heal_success: u64,
-    pub disable_for_today: u64,
-}
-
-#[cfg(feature = "test-mode")]
-impl LatencyMetrics {
-    pub fn counters_snapshot(&self) -> LatencyCountersSnapshot {
-        LatencyCountersSnapshot {
-            auto_heal_attempts: self.auto_heal_attempts,
-            auto_heal_success: self.auto_heal_success,
-            disable_for_today: self.disable_for_today,
-        }
-    }
 }

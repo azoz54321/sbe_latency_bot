@@ -22,8 +22,6 @@ pub struct ModeMachine {
     enter_candidate_since: Option<Instant>,
     loss_lockout: bool,
     last_transition: Instant,
-    #[cfg(feature = "test-mode")]
-    force_live_override: bool,
 }
 
 impl ModeMachine {
@@ -35,8 +33,6 @@ impl ModeMachine {
             enter_candidate_since: None,
             loss_lockout: false,
             last_transition: now,
-            #[cfg(feature = "test-mode")]
-            force_live_override: false,
         }
     }
 
@@ -52,12 +48,6 @@ impl ModeMachine {
         ahi_drop: f64,
         btc_ret_15m_abs: f64,
     ) -> Mode {
-        #[cfg(feature = "test-mode")]
-        if self.force_live_override {
-            self.state = Mode::LiveTrading;
-            return self.state;
-        }
-
         match self.state {
             Mode::LiveTrading => {
                 if self.should_exit_live(ahi_value, ahi_drop, btc_ret_15m_abs) {
@@ -120,18 +110,6 @@ impl ModeMachine {
     }
 
     pub fn is_live(&self) -> bool {
-        #[cfg(feature = "test-mode")]
-        if self.force_live_override {
-            return true;
-        }
         self.state.is_live()
-    }
-
-    #[cfg(feature = "test-mode")]
-    pub fn force_live_for_tests(&mut self, live: bool) {
-        self.force_live_override = live;
-        if live {
-            self.state = Mode::LiveTrading;
-        }
     }
 }
