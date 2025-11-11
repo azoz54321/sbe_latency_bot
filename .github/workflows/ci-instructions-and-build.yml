@@ -19,6 +19,10 @@ jobs:
       - name: Validate header & required log tags in instructions
         shell: bash
         run: |
+          echo "First line (debug):"
+          head -n1 .github/copilot-instructions.md | cat -A
+          echo "MIME (debug):"
+          file -bi .github/copilot-instructions.md
           egrep -q "إرشادات Copilot (—|-)\s+sbe_latency_bot" .github/copilot-instructions.md
           grep -q "[BOOT]"   .github/copilot-instructions.md
           grep -q "[HARAM]"  .github/copilot-instructions.md
