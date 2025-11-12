@@ -67,8 +67,11 @@ jobs:
         run: |
           test -f native/schemas/spot_sbe.xml
           mkdir -p native/include
-          java -jar .tools/sbe-all.jar -o native/include -l cpp native/schemas/spot_sbe.xml
-          test -f native/include/spot_sbe/BoolEnum.h
+          java -Dsbe.target.language=CPP \
+               -Dsbe.output.dir=native/include \
+               -Dsbe.target.namespace=spot_stream \
+               -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml
+          test -f native/include/spot_stream/BoolEnum.h
 
       - name: Build release (shadow-mode)
         run: |

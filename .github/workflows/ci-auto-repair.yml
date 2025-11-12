@@ -2,7 +2,7 @@
 
 on:
   workflow_run:
-    # نشغّل على أي ووركفلو يكتمل؛ نفلتر بالشرط تحت
+    # Trigger on any completed workflow run; filter in the job condition.
     types:
       - completed
 
@@ -72,8 +72,8 @@ jobs:
 
           has_change=0
 
-          # Rule A: Missing SBE headers (e.g., fatal error: spot_sbe/*.h: No such file)
-          if grep -Eqi 'fatal error: .*spot_sbe/.+No such file or directory' build.log; then
+          # Rule A: Missing SBE headers (e.g., fatal error: spot_stream/*.h: No such file)
+          if grep -Eqi 'fatal error: .*spot_stream/.+No such file or directory' build.log; then
             echo "[rule] ensure SBE generation steps"
             FILE=".github/workflows/ci-instructions-and-build.yml"
 
@@ -106,7 +106,7 @@ jobs:
                         },
                         {
                           name: "Generate SBE headers (C++)",
-                          run: "mkdir -p native/include && java -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_sbe -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml && ls -R native/include | sed -n \"1,200p\""
+                          run: "mkdir -p native/include && java -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_stream -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml && ls -R native/include | sed -n \"1,200p\""
                         }] +
                       $steps[$i:]
                       )

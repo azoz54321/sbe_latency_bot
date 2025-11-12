@@ -1,10 +1,10 @@
 use std::path::Path;
 
 fn main() {
-    let header = Path::new("native/include/spot_sbe/BoolEnum.h");
+    let header = Path::new("native/include/spot_stream/BoolEnum.h");
     if !header.exists() {
         panic!(
-            "Missing SBE headers at native/include/spot_sbe/*.h \nGenerate them with:\n  java -jar .tools/sbe-all.jar -o native/include -l cpp native/schemas/spot_sbe.xml \n(Our GitHub Actions runs this step automatically in 'Generate SBE headers (C++)')"
+            "Missing SBE headers at native/include/spot_stream/*.h \nGenerate them with:\n  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_stream native/schemas/spot_sbe.xml \n(Our GitHub Actions runs this step automatically in 'Generate SBE headers (C++)')"
         );
     }
 
