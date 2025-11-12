@@ -66,24 +66,14 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p native/include
-
-          # Generate under spot_stream (new namespace)
           java -Dsbe.target.language=CPP \
                -Dsbe.output.dir=native/include \
                -Dsbe.target.namespace=spot_stream \
                -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml
-
-          # Generate under spot_sbe (compat with existing C++ includes)
-          java -Dsbe.target.language=CPP \
-               -Dsbe.output.dir=native/include \
-               -Dsbe.target.namespace=spot_sbe \
-               -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml
-
           echo "---- headers tree (first 200 lines) ----"
           ls -R native/include | sed -n '1,200p'
-
-          # Assert that at least one namespace dir exists
-          test -d native/include/spot_stream || test -d native/include/spot_sbe
+          test -d native/include/spot_stream
+          test "$(ls -1 native/include/spot_stream | wc -l)" -gt 0
 
       - name: Build release (shadow-mode)
         run: |

@@ -17,21 +17,15 @@ fn main() {
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=dylib=c++");
 
-    let h1 = Path::new("native/include/spot_stream/BoolEnum.h");
-    let h2 = Path::new("native/include/spot_sbe/BoolEnum.h");
-
-    if !h1.exists() && !h2.exists() {
+    let h = Path::new("native/include/spot_stream/BoolEnum.h");
+    if !h.exists() {
         panic!(concat!(
-            "Missing SBE headers under native/include/(spot_stream|spot_sbe)/*.h\n",
+            "Missing SBE headers under native/include/spot_stream/*.h\n",
             "Generate with:\n",
-            "  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP ",
-            "-Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_stream ",
-            "native/schemas/spot_sbe.xml\n",
-            "and/or:\n",
-            "  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP ",
-            "-Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_sbe ",
-            "native/schemas/spot_sbe.xml\n",
-            "(CI runs these in 'Generate SBE headers (C++)')\n"
+            "  java -jar .tools/sbe-all.jar ",
+            "-Dsbe.target.language=CPP -Dsbe.output.dir=native/include ",
+            "-Dsbe.target.namespace=spot_stream native/schemas/spot_sbe.xml\n",
+            "(CI runs this in 'Generate SBE headers (C++)')\n"
         ));
     }
 

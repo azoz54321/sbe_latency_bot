@@ -6,11 +6,26 @@
 #include <limits>
 #include <stdexcept>
 
-#include "spot_sbe/BoolEnum.h"
 #include "spot_sbe/MessageHeader.h"
 #include "spot_sbe/TradesResponse.h"
 #include "spot_sbe/WebSocketResponse.h"
-#include "spot_stream/TradesStreamEvent.h"
+
+// ---- SBE Trade event includes across spot_stream schema variants ----
+#if __has_include("spot_stream/TradeEvent.h")
+#  include "spot_stream/TradeEvent.h"
+#elif __has_include("spot_stream/TradesStreamEvent.h")
+#  include "spot_stream/TradesStreamEvent.h"
+#elif __has_include("spot_stream/Trades.h")
+#  include "spot_stream/Trades.h"
+#else
+#  error "No known Trade* header found under spot_stream."
+#endif
+
+#if __has_include("spot_stream/BoolEnum.h")
+#  include "spot_stream/BoolEnum.h"
+#else
+#  error "BoolEnum.h not found under spot_stream."
+#endif
 
 namespace {
 
@@ -374,7 +389,7 @@ int decode_trades_message(char* buffer,
 
 }  // namespace
 
-// Expose a stable C ABI symbol so the Rust FFI can link bsbe_try_decode_one.
+// Expose C symbols so Rust can link without C++ name mangling.
 extern "C" int bsbe_try_decode_one(const std::uint8_t* buf,
                                    std::size_t len,
                                    BsbeTrade* out,
