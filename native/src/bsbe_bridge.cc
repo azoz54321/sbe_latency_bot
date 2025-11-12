@@ -374,6 +374,7 @@ int decode_trades_message(char* buffer,
 
 }  // namespace
 
+// Expose a stable C ABI symbol so the Rust FFI can link bsbe_try_decode_one.
 extern "C" int bsbe_try_decode_one(const std::uint8_t* buf,
                                    std::size_t len,
                                    BsbeTrade* out,
