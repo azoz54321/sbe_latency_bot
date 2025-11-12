@@ -6,9 +6,9 @@
 #include <limits>
 #include <stdexcept>
 
-#include "spot_sbe/MessageHeader.h"
-#include "spot_sbe/TradesResponse.h"
-#include "spot_sbe/WebSocketResponse.h"
+#include "spot_stream/MessageHeader.h"
+#include "spot_stream/TradesResponse.h"
+#include "spot_stream/WebSocketResponse.h"
 
 // ---- SBE Trade event includes across spot_stream schema variants ----
 #if __has_include("spot_stream/TradeEvent.h")
