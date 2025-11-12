@@ -51,6 +51,7 @@ fastrand = "2"
 [features]
 default = ["prod"]
 prod = []
+shadow-mode = []
 
 [build-dependencies]
 cmake = "0.1"
