@@ -6,26 +6,41 @@
 #include <limits>
 #include <stdexcept>
 
-#include "spot_stream/MessageHeader.h"
-#include "spot_stream/TradesResponse.h"
-#include "spot_stream/WebSocketResponse.h"
+// === SBE includes (unified to spot_stream) ===
+#if __has_include("spot_stream/MessageHeader.h")
+#  include "spot_stream/MessageHeader.h"
+#else
+#  error "Missing spot_stream/MessageHeader.h"
+#endif
 
-// ---- SBE Trade event includes across spot_stream schema variants ----
-#if __has_include("spot_stream/TradeEvent.h")
-#  include "spot_stream/TradeEvent.h"
-#elif __has_include("spot_stream/TradesStreamEvent.h")
+#if __has_include("spot_stream/BoolEnum.h")
+#  include "spot_stream/BoolEnum.h"
+#else
+#  error "Missing spot_stream/BoolEnum.h"
+#endif
+
+// From stream_1_0.xml (WebSocket trades stream events)
+#if __has_include("spot_stream/TradesStreamEvent.h")
 #  include "spot_stream/TradesStreamEvent.h"
+#elif __has_include("spot_stream/TradeEvent.h")
+#  include "spot_stream/TradeEvent.h"
 #elif __has_include("spot_stream/Trades.h")
 #  include "spot_stream/Trades.h"
 #else
 #  error "No known Trade* header found under spot_stream."
 #endif
 
-#if __has_include("spot_stream/BoolEnum.h")
-#  include "spot_stream/BoolEnum.h"
+// From spot_3_1.xml (Trades REST responses)
+#if __has_include("spot_stream/TradesResponse.h")
+#  include "spot_stream/TradesResponse.h"
 #else
-#  error "BoolEnum.h not found under spot_stream."
+#  error "Missing spot_stream/TradesResponse.h"
 #endif
+
+// Optional: internal alias for brevity.
+namespace bsbe = spot_stream;
+
+#include "spot_stream/WebSocketResponse.h"
 
 namespace {
 
@@ -35,7 +50,7 @@ constexpr std::uint16_t kStreamSchemaId = 1;
 constexpr std::uint16_t kTradesTemplateId = 201;
 constexpr std::uint16_t kWsTemplateId = 50;
 constexpr std::uint16_t kStreamTradesTemplateId =
-    spot_stream::TradesStreamEvent::SBE_TEMPLATE_ID;
+  bsbe::TradesStreamEvent::SBE_TEMPLATE_ID;
 
 constexpr std::int32_t kErrIncomplete = -1;
 constexpr std::int32_t kErrCorrupt = -2;
@@ -126,8 +141,8 @@ std::uint64_t to_ns_signed(std::int64_t time_us) {
   return to_ns(static_cast<std::uint64_t>(time_us));
 }
 
-std::uint8_t to_side(spot_sbe::BoolEnum::Value maker_flag) {
-  return maker_flag == spot_sbe::BoolEnum::True ? 1 : 0;
+std::uint8_t to_side(bsbe::BoolEnum::Value maker_flag) {
+  return maker_flag == bsbe::BoolEnum::True ? 1 : 0;
 }
 
 int decode_trades_payload(char* payload,
@@ -141,7 +156,7 @@ int decode_trades_payload(char* payload,
     return kErrOutputTruncated;
   }
 
-  spot_sbe::TradesResponse trades;
+  bsbe::TradesResponse trades;
   try {
     trades.wrapForDecode(
         payload, kHeaderSize, acting_block_length, acting_version, payload_len);
@@ -189,7 +204,7 @@ int decode_trades_payload(char* payload,
 
 int decode_stream_trades_message(char* buffer,
                                  std::size_t len,
-                                 const spot_sbe::MessageHeader& header,
+                                 const bsbe::MessageHeader& header,
                                  BsbeTrade* out,
                                  std::size_t out_cap,
                                  std::size_t* consumed) {
@@ -197,7 +212,7 @@ int decode_stream_trades_message(char* buffer,
     return kErrOutputTruncated;
   }
 
-  spot_stream::TradesStreamEvent event;
+  bsbe::TradesStreamEvent event;
   try {
     event.wrapForDecode(
         buffer, kHeaderSize, header.blockLength(), header.version(), len);
@@ -233,8 +248,8 @@ int decode_stream_trades_message(char* buffer,
     BsbeTrade& dst = out[index];
     dst.px_e8 = scale_to_e8(trades_group.price(), price_exp);
     dst.qty_e8 = scale_to_e8(trades_group.qty(), qty_exp);
-    dst.side =
-        trades_group.isBuyerMaker() == spot_stream::BoolEnum::True ? 1 : 0;
+  dst.side =
+    trades_group.isBuyerMaker() == bsbe::BoolEnum::True ? 1 : 0;
     dst._pad0 = 0;
     dst._pad1 = 0;
     dst.symbol_id = 0;
@@ -259,7 +274,7 @@ int decode_stream_trades_message(char* buffer,
 
 int decode_stream_trades_message(char* buffer,
                                  std::size_t len,
-                                 const spot_sbe::MessageHeader& header,
+                                 const bsbe::MessageHeader& header,
                                  BsbeTrade* out,
                                  std::size_t out_cap,
                                  std::size_t* consumed);
@@ -273,7 +288,7 @@ int decode_nested_message(const char* payload,
   }
 
   auto nested_buffer = const_cast<char*>(payload);
-  spot_sbe::MessageHeader nested_header;
+  bsbe::MessageHeader nested_header;
   try {
     nested_header.wrap(nested_buffer, 0, 0, payload_len);
   } catch (const std::exception&) {
@@ -317,11 +332,11 @@ int decode_nested_message(const char* payload,
 
 int decode_ws_response(char* buffer,
                        std::size_t len,
-                       const spot_sbe::MessageHeader& header,
+                       const bsbe::MessageHeader& header,
                        BsbeTrade* out,
                        std::size_t out_cap,
                        std::size_t* consumed) {
-  spot_sbe::WebSocketResponse message;
+  bsbe::WebSocketResponse message;
   try {
     message.wrapForDecode(
         buffer, kHeaderSize, header.blockLength(), header.version(), len);
@@ -371,7 +386,7 @@ int decode_ws_response(char* buffer,
 
 int decode_trades_message(char* buffer,
                           std::size_t len,
-                          const spot_sbe::MessageHeader& header,
+                          const bsbe::MessageHeader& header,
                           BsbeTrade* out,
                           std::size_t out_cap,
                           std::size_t* consumed) {
@@ -410,7 +425,7 @@ extern "C" int bsbe_try_decode_one(const std::uint8_t* buf,
 
   auto buffer = reinterpret_cast<char*>(const_cast<std::uint8_t*>(buf));
 
-  spot_sbe::MessageHeader header;
+  bsbe::MessageHeader header;
   try {
     header.wrap(buffer, 0, 0, len);
   } catch (const std::exception&) {
