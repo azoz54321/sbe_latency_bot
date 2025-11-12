@@ -1,1 +1,215 @@
-<ÇáÕÞ ÇáãáÝ ÃÚáÇå åäÇ ßÇãáðÇ ßãÇ åæ>
+ï»¿name: CI Auto-Repair
+
+on:
+  workflow_run:
+    # Ù†Ø´ØºÙ‘Ù„ Ø¹Ù„Ù‰ Ø£ÙŠ ÙˆÙˆØ±ÙƒÙÙ„Ùˆ ÙŠÙƒØªÙ…Ù„Ø› Ù†ÙÙ„ØªØ± Ø¨Ø§Ù„Ø´Ø±Ø· ØªØ­Øª
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  repair:
+    if: >
+      ${{
+        github.event.workflow_run.conclusion == 'failure' &&
+        !contains(github.event.workflow_run.head_commit.message, '[no-autofix]') &&
+        github.event.workflow_run.name != 'CI Auto-Repair' &&
+        (
+          contains(github.event.workflow_run.name, 'Copilot instructions & build') ||
+          contains(github.event.workflow_run.name, 'instructions & build') ||
+          contains(github.event.workflow_run.name, 'build')
+        )
+      }}
+    runs-on: ubuntu-latest
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout failing commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+
+      - name: Install tools (jq, yq, unzip, Java)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip openjdk-17-jre-headless
+          curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq
+          sudo install yq /usr/local/bin/yq
+
+      - name: Fetch failed job logs
+        run: |
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs" > jobs.json
+          BUILD_JOB_ID=$(jq -r '.jobs[] | select(.name|test("Build")) | .id' jobs.json | head -n1)
+          if [ -z "$BUILD_JOB_ID" ]; then
+            BUILD_JOB_ID=$(jq -r '.jobs[] | .id' jobs.json | head -n1)
+          fi
+          if [ -z "$BUILD_JOB_ID" ]; then
+            echo "No job found; abort." && exit 0
+          fi
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -L \
+            "https://api.github.com/repos/${GH_REPO}/actions/jobs/${BUILD_JOB_ID}/logs" -o joblogs.zip
+          unzip -p joblogs.zip > build.log || true
+          echo "---- first 200 lines of build.log ----"
+          sed -n '1,200p' build.log || true
+
+      - name: Run auto-fix rules
+        id: fix
+        run: |
+          set -e
+          COUNT=$(git log --oneline | grep -c '\[auto-repair\]' || true)
+          if [ "$COUNT" -ge 3 ]; then
+            echo "Max auto-repair attempts reached." && exit 0
+          fi
+
+          has_change=0
+
+          # Rule A: Missing SBE headers (e.g., fatal error: spot_sbe/*.h: No such file)
+          if grep -Eqi 'fatal error: .*spot_sbe/.+No such file or directory' build.log; then
+            echo "[rule] ensure SBE generation steps"
+            FILE=".github/workflows/ci-instructions-and-build.yml"
+
+            # Ensure System deps contains Java
+            yq -i '
+              .jobs.*.steps[] |=
+                if .name == "System deps" then
+                  if (.run | contains("openjdk-17")) then . else
+                    .run += "\nsudo apt-get install -y openjdk-17-jre-headless"
+                  end
+                else . end' "$FILE"
+
+            # Insert SBE steps before "Build release" if missing
+            if ! grep -q 'Generate SBE headers (C++)' "$FILE"; then
+              yq -i '
+                (.jobs.*.steps) as $s |
+                .jobs.*.steps |=
+                  ( . as $steps |
+                    ($steps | map(.name) | index("Build release") ) as $i |
+                    if $i == null then $steps else
+                      ($steps[0:$i] +
+                       [{
+                          name: "Fetch SBE tool",
+                          run: "mkdir -p .tools && curl -fsSL -o .tools/sbe-all.jar https://repo1.maven.org/maven2/uk/co/real-logic/sbe-all/1.36.2/sbe-all-1.36.2.jar"
+                        },
+                        {
+                          name: "Fetch Binance Spot SBE schema (3:1)",
+                          env: { GH_TOKEN: "${{ github.token }}" },
+                          run: "mkdir -p native/schemas && gh api -H \"Accept: application/vnd.github.raw\" /repos/binance/binance-spot-api-docs/contents/sbe/schemas/spot_3_1.xml > native/schemas/spot_sbe.xml && test -s native/schemas/spot_sbe.xml"
+                        },
+                        {
+                          name: "Generate SBE headers (C++)",
+                          run: "mkdir -p native/include && java -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_sbe -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml && ls -R native/include | sed -n \"1,200p\""
+                        }] +
+                      $steps[$i:]
+                      )
+                    end )' "$FILE"
+              has_change=1
+            fi
+
+            # Ensure native include dir on CMake target
+            if [ -f native/CMakeLists.txt ] && ! grep -q 'target_include_directories' native/CMakeLists.txt; then
+              echo 'target_include_directories(bsbe_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)' >> native/CMakeLists.txt
+              has_change=1
+            fi
+
+            # Ignore generated headers
+            if ! grep -q '^native/include/' .gitignore 2>/dev/null; then
+              echo "native/include/" >> .gitignore
+              has_change=1
+            fi
+          fi
+
+          # Rule B: OpenSSL / pkg-config
+          if grep -Eqi 'openssl|openssl-sys|pkg-config.*not.*found' build.log; then
+            echo "[rule] ensure OpenSSL dev deps"
+            yq -i '
+              .jobs.*.steps[] |=
+                if .name == "System deps" then
+                  if (.run | contains("libssl-dev")) then . else
+                    .run += "\nsudo apt-get install -y pkg-config libssl-dev"
+                  end
+                else . end' .github/workflows/ci-instructions-and-build.yml
+            has_change=1
+          fi
+
+          # Rule C: C/C++ toolchain and/or protoc
+          if grep -Eqi 'c\+\+: command not found|clang: not found|CXX.*not found' build.log; then
+            echo "[rule] ensure clang"
+            yq -i '
+              .jobs.*.steps[] |=
+                if .name == "System deps" then
+                  if (.run | contains("clang")) then . else
+                    .run += "\nsudo apt-get install -y clang"
+                  end
+                else . end' .github/workflows/ci-instructions-and-build.yml
+            has_change=1
+          fi
+          if grep -Eqi 'protoc: not found|protobuf' build.log; then
+            echo "[rule] ensure protobuf-compiler"
+            yq -i '
+              .jobs.*.steps[] |=
+                if .name == "System deps" then
+                  if (.run | contains("protobuf-compiler")) then . else
+                    .run += "\nsudo apt-get install -y protobuf-compiler"
+                  end
+                else . end' .github/workflows/ci-instructions-and-build.yml
+            has_change=1
+          fi
+
+          # Rule D: Unknown Cargo feature (shadow-mode)
+          if grep -Eqi 'does not contain this feature: shadow-mode' build.log; then
+            echo "[rule] add no-op feature shadow-mode"
+            if ! grep -q '^\[features\]' Cargo.toml; then
+              printf "\n[features]\nshadow-mode = []\n" >> Cargo.toml
+            elif ! grep -q '^shadow-mode' Cargo.toml; then
+              printf "shadow-mode = []\n" >> Cargo.toml
+            fi
+            has_change=1
+          fi
+
+          if [ "$has_change" -eq 1 ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create PR (auto-merge)
+        if: steps.fix.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "[auto-repair] apply CI fixes from logs (run ${{ env.RUN_ID }})"
+          title: "[auto-repair] Fix CI from run ${{ env.RUN_ID }}"
+          body: "Automated fixes based on build.log. Add [no-autofix] to any commit to skip."
+          branch: "auto-repair/${{ env.RUN_ID }}"
+          base: "main"
+          labels: "auto-repair"
+          signoff: false
+          draft: false
+          delete-branch: true
+          add-paths: |
+            .github/workflows/ci-instructions-and-build.yml
+            native/CMakeLists.txt
+            .gitignore
+            Cargo.toml
+
+      - name: Enable auto-merge (squash)
+        if: steps.fix.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gh || true
+          fi
+          PR_NUMBER=$(gh pr list --search "auto-repair/${RUN_ID} in:title" --json number -q '.[0].number')
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr merge "$PR_NUMBER" --squash --auto
+          fi
+
