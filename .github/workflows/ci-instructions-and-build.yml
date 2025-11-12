@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 env:
@@ -138,6 +138,36 @@ jobs:
           name: sbe_latency_bot-linux-x86_64
           path: target/release/sbe_latency_bot
           if-no-files-found: error
+
+      - name: Prepare release assets
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp -f target/release/sbe_latency_bot dist/sbe_latency_bot
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum dist/sbe_latency_bot | tee dist/sbe_latency_bot.sha256
+          else
+            shasum -a 256 dist/sbe_latency_bot | tee dist/sbe_latency_bot.sha256
+          fi
+          ls -l dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          TAG="v${GITHUB_RUN_NUMBER}"
+          TITLE="sbe_latency_bot ${TAG}"
+          NOTES="Automated build from ${GITHUB_SHA::7}. Run: ${GITHUB_RUN_ID}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/sbe_latency_bot dist/sbe_latency_bot.sha256 --clobber
+          else
+            gh release create "$TAG" dist/sbe_latency_bot dist/sbe_latency_bot.sha256 \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --latest
+          fi
 
       - name: Upload CI logs
         if: always()
