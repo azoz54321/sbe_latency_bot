@@ -1,0 +1,75 @@
+﻿name: CI - Test Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang openjdk-17-jre-headless
+
+      - name: Fetch SBE tool
+        run: |
+          mkdir -p .tools
+          curl -fsSL -o .tools/sbe-all.jar https://repo1.maven.org/maven2/uk/co/real-logic/sbe-all/1.36.2/sbe-all-1.36.2.jar
+
+      - name: Fetch Binance Spot SBE schema (3:1)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p native/schemas
+          curl -fsSL \
+               -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github.raw" \
+               https://api.github.com/repos/binance/binance-spot-api-docs/contents/sbe/schemas/spot_3_1.xml \
+               -o native/schemas/spot_sbe.xml
+          test -s native/schemas/spot_sbe.xml
+
+      - name: Generate SBE headers (C++)
+        run: |
+          mkdir -p native/include
+          java -Dsbe.target.language=CPP \
+               -Dsbe.output.dir=native/include \
+               -Dsbe.target.namespace=spot_sbe \
+               -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml
+          echo "---- generated headers (first 200 lines) ----"
+          ls -R native/include | sed -n '1,200p'
+
+      - name: Build release
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo build --release
+
+      - name: Test (compile only)
+        run: cargo test --no-run -q
+
+      - name: Upload CI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            native/include
+          if-no-files-found: ignore
