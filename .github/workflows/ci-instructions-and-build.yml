@@ -53,13 +53,22 @@ jobs:
           rustc -Vv || true >> logs/env.txt
           cargo -V  || true >> logs/env.txt
 
-      - name: Install native toolchain (cmake, gcc, deps)
+      - name: System deps
         run: |
-          set -o pipefail
-          sudo apt-get update 2>&1 | tee logs/apt.log
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config libssl-dev \
-            clang llvm-dev libclang-dev ninja-build zlib1g-dev 2>&1 | tee -a logs/apt.log
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang protobuf-compiler openjdk-17-jdk
+
+      - name: Fetch SBE tool
+        run: |
+          mkdir -p .tools
+          curl -sSL -o .tools/sbe-all.jar https://repo1.maven.org/maven2/uk/co/real-logic/sbe-all/1.31.0/sbe-all-1.31.0.jar
+
+      - name: Generate SBE headers (C++)
+        run: |
+          test -f native/schemas/spot_sbe.xml
+          mkdir -p native/include
+          java -jar .tools/sbe-all.jar -o native/include -l cpp native/schemas/spot_sbe.xml
+          test -f native/include/spot_sbe/BoolEnum.h
 
       - name: Build release (shadow-mode)
         run: |

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<messageSchema package="spot_sbe">
+  <!-- Binance Spot SBE schema goes here. Replace this comment with the actual schema content used by your bridge. -->
+  <types package="spot_sbe">
+    <!-- ...schema types... -->
+  </types>
+  <!-- ...other schema elements... -->
+</messageSchema>

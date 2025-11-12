@@ -1,4 +1,13 @@
+use std::path::Path;
+
 fn main() {
+    let header = Path::new("native/include/spot_sbe/BoolEnum.h");
+    if !header.exists() {
+        panic!(
+            "Missing SBE headers at native/include/spot_sbe/*.h \nGenerate them with:\n  java -jar .tools/sbe-all.jar -o native/include -l cpp native/schemas/spot_sbe.xml \n(Our GitHub Actions runs this step automatically in 'Generate SBE headers (C++)')"
+        );
+    }
+
     let dst = cmake::Config::new("native").build();
     println!(
         "cargo:rustc-link-search=native={}",

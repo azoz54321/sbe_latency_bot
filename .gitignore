@@ -4,6 +4,8 @@ tmp_*.diff
 target/
 logs/
 
+
+native/include/
 spot_sbe/
 spot_sbe_tmp/
 .deps/
