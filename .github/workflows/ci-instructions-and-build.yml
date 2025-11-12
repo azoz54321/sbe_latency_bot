@@ -62,6 +62,12 @@ jobs:
         run: |
           mkdir -p .tools
           curl -sSL -o .tools/sbe-all.jar https://repo1.maven.org/maven2/uk/co/real-logic/sbe-all/1.31.0/sbe-all-1.31.0.jar
+      - name: Sync schema inputs
+        run: |
+          set -euo pipefail
+          mkdir -p native/schemas
+          cp schemas/binance_sbe.xml native/schemas/spot_sbe.xml
+          cp schemas/binance_stream_sbe.xml native/schemas/stream_1_0.xml
       - name: Generate SBE headers (C++)
         run: |
           set -euxo pipefail
@@ -70,10 +76,14 @@ jobs:
                -Dsbe.output.dir=native/include \
                -Dsbe.target.namespace=spot_stream \
                -jar .tools/sbe-all.jar native/schemas/spot_sbe.xml
+          java -Dsbe.target.language=CPP \
+               -Dsbe.output.dir=native/include \
+               -Dsbe.target.namespace=spot_stream \
+               -jar .tools/sbe-all.jar native/schemas/stream_1_0.xml
           echo "---- headers tree (first 200 lines) ----"
           ls -R native/include | sed -n '1,200p'
-          test -d native/include/spot_stream
-          test "$(ls -1 native/include/spot_stream | wc -l)" -gt 0
+          test -f native/include/spot_stream/MessageHeader.h
+          test -f native/include/spot_stream/TradesStreamEvent.h
 
       - name: Build release (shadow-mode)
         run: |
