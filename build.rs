@@ -1,10 +1,14 @@
 use std::path::Path;
 
 fn main() {
-    let header = Path::new("native/include/spot_stream/BoolEnum.h");
-    if !header.exists() {
+    let h1 = Path::new("native/include/spot_stream/BoolEnum.h");
+    let h2 = Path::new("native/include/spot_sbe/BoolEnum.h");
+    if !h1.exists() && !h2.exists() {
         panic!(
-            "Missing SBE headers at native/include/spot_stream/*.h \nGenerate them with:\n  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_stream native/schemas/spot_sbe.xml \n(Our GitHub Actions runs this step automatically in 'Generate SBE headers (C++)')"
+            "Missing SBE headers under native/include/(spot_stream|spot_sbe)/*.h\n"
+                "Generate with:\n  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_stream native/schemas/spot_sbe.xml\n"
+                "and/or:\n  java -jar .tools/sbe-all.jar -Dsbe.target.language=CPP -Dsbe.output.dir=native/include -Dsbe.target.namespace=spot_sbe native/schemas/spot_sbe.xml\n"
+                "(CI runs these in 'Generate SBE headers (C++)')"
         );
     }
 
@@ -21,4 +25,5 @@ fn main() {
     println!("cargo:rerun-if-changed=native/src/bsbe_bridge.cc");
     println!("cargo:rerun-if-changed=schemas/binance_sbe.xml");
     println!("cargo:rerun-if-changed=native/generated");
+    println!("cargo:rerun-if-changed=native/schemas/spot_sbe.xml");
 }
