@@ -1,0 +1,10 @@
+^C:\USERS\AZOZ4\DOCUMENTS\SBE_LATENCY_BOT\NATIVE\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/azoz4/Documents/sbe_latency_bot/native -BC:/Users/azoz4/Documents/sbe_latency_bot/native/build --check-stamp-file C:/Users/azoz4/Documents/sbe_latency_bot/native/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

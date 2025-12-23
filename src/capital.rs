@@ -8,6 +8,15 @@ pub enum SlotId {
     B,
 }
 
+impl SlotId {
+    pub fn label(self) -> &'static str {
+        match self {
+            SlotId::A => "A",
+            SlotId::B => "B",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SlotState {
     occupied: bool,
@@ -77,40 +86,6 @@ impl CapitalSlots {
             slot.occupied = false;
             slot.symbol = None;
             slot.reserved_at = None;
-        }
-    }
-
-    #[cfg(feature = "test-mode")]
-    pub fn snapshot(&self) -> CapitalSnapshot {
-        CapitalSnapshot {
-            slot_a: SlotSnapshot::from_state(&self.slots[0]),
-            slot_b: SlotSnapshot::from_state(&self.slots[1]),
-        }
-    }
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug, Default)]
-pub struct CapitalSnapshot {
-    pub slot_a: SlotSnapshot,
-    pub slot_b: SlotSnapshot,
-}
-
-#[cfg(feature = "test-mode")]
-#[derive(Clone, Debug, Default)]
-pub struct SlotSnapshot {
-    pub occupied: bool,
-    pub symbol: Option<Symbol>,
-    pub has_rebalance_marker: bool,
-}
-
-#[cfg(feature = "test-mode")]
-impl SlotSnapshot {
-    fn from_state(state: &SlotState) -> Self {
-        Self {
-            occupied: state.occupied,
-            symbol: state.symbol,
-            has_rebalance_marker: state.reserved_at.is_some(),
         }
     }
 }

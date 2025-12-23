@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerSpec};
 use crate::types::{LogMessage, MetricEvent, Symbol, TickToSendMetric};
@@ -35,7 +35,7 @@ struct LogAggregator {
 
 impl LogAggregator {
     fn new(config: &'static Config, server: &'static ServerSpec, rx: Receiver<LogMessage>) -> Self {
-        info!(
+        debug!(
             target: "bot",
             "log aggregator ready: active_server={:?} log_flush={}ms",
             server.id,
@@ -82,12 +82,16 @@ impl LogAggregator {
 
         info!(
             target: "bot",
-            "stats server={:?} ws_in={} ws_text_in={} price_in={} decode_err={} triggers={} late={} queue_drop_market={} queue_drop_trigger={} seq_anomaly={} buy_ok={} buy_err={} suppressed={} price_to_send_ms_p50={:.2} p95={:.2} trigger_to_send_ms_p50={:.2} p95={:.2}{}",
+            "stats server={:?} ws_in={} ws_text_in={} price_in={} decode_ok={} decode_need_more={} decode_corrupt={} decode_schema_mismatch={} decode_truncated={} triggers={} late={} queue_drop_market={} queue_drop_trigger={} seq_anomaly={} buy_ok={} buy_err={} suppressed={} price_to_send_ms_p50={:.2} p95={:.2} trigger_to_send_ms_p50={:.2} p95={:.2}{}",
             self.server.id,
             self.stats.ws_in,
             self.stats.ws_text_in,
             self.stats.price_in,
-            self.stats.decode_err,
+            self.stats.decode_ok,
+            self.stats.decode_need_more,
+            self.stats.decode_corrupt,
+            self.stats.decode_schema_mismatch,
+            self.stats.decode_truncated,
             self.stats.trigger_emitted,
             self.stats.trigger_drop_late,
             self.stats.queue_drop_market,
@@ -110,7 +114,11 @@ struct Stats {
     ws_in: u64,
     ws_text_in: u64,
     price_in: u64,
-    decode_err: u64,
+    decode_ok: u64,
+    decode_need_more: u64,
+    decode_corrupt: u64,
+    decode_schema_mismatch: u64,
+    decode_truncated: u64,
     queue_drop_market: u64,
     queue_drop_trigger: u64,
     seq_anomaly: u64,
@@ -130,6 +138,19 @@ struct Stats {
     last_trigger_emitted: Option<Symbol>,
     last_buy_ok: Option<Symbol>,
     last_signal_suppressed: Option<Symbol>,
+    risk_freeze_daily_loss: u64,
+    bans_created_30d: u64,
+    deny_rebuy_today: u64,
+    deny_haram: u64,
+    last_risk_ban: Option<Symbol>,
+    last_deny_rebuy: Option<Symbol>,
+    last_deny_haram: Option<Symbol>,
+    rx_trigger_events: u64,
+    rx_buy_ok_events: u64,
+    rx_tick_to_send_events: u64,
+    logged_trigger_once: bool,
+    logged_buy_ok_once: bool,
+    logged_tick_once: bool,
 }
 
 impl Stats {
@@ -137,7 +158,11 @@ impl Stats {
         self.ws_in = 0;
         self.ws_text_in = 0;
         self.price_in = 0;
-        self.decode_err = 0;
+        self.decode_ok = 0;
+        self.decode_need_more = 0;
+        self.decode_corrupt = 0;
+        self.decode_schema_mismatch = 0;
+        self.decode_truncated = 0;
         self.queue_drop_market = 0;
         self.queue_drop_trigger = 0;
         self.seq_anomaly = 0;
@@ -157,6 +182,19 @@ impl Stats {
         self.last_trigger_emitted = None;
         self.last_buy_ok = None;
         self.last_signal_suppressed = None;
+        self.risk_freeze_daily_loss = 0;
+        self.bans_created_30d = 0;
+        self.deny_rebuy_today = 0;
+        self.deny_haram = 0;
+        self.last_risk_ban = None;
+        self.last_deny_rebuy = None;
+        self.last_deny_haram = None;
+        self.rx_trigger_events = 0;
+        self.rx_buy_ok_events = 0;
+        self.rx_tick_to_send_events = 0;
+        self.logged_trigger_once = false;
+        self.logged_buy_ok_once = false;
+        self.logged_tick_once = false;
     }
 
     fn apply(&mut self, event: MetricEvent) {
@@ -164,7 +202,11 @@ impl Stats {
             MetricEvent::WsMsgIn => self.ws_in += 1,
             MetricEvent::WsTextIn => self.ws_text_in += 1,
             MetricEvent::PriceEventIn => self.price_in += 1,
-            MetricEvent::DecodeErr => self.decode_err += 1,
+            MetricEvent::DecodeOk => self.decode_ok += 1,
+            MetricEvent::DecodeNeedMore => self.decode_need_more += 1,
+            MetricEvent::DecodeCorrupt => self.decode_corrupt += 1,
+            MetricEvent::DecodeSchemaMismatch => self.decode_schema_mismatch += 1,
+            MetricEvent::DecodeTruncated => self.decode_truncated += 1,
             MetricEvent::QueueDropMarket { symbol } => {
                 self.queue_drop_market += 1;
                 self.last_queue_drop_market = Some(symbol);
@@ -184,6 +226,11 @@ impl Stats {
             MetricEvent::TriggerEmitted { symbol } => {
                 self.trigger_emitted += 1;
                 self.last_trigger_emitted = Some(symbol);
+                self.rx_trigger_events = self.rx_trigger_events.saturating_add(1);
+                if !self.logged_trigger_once {
+                    debug!(target: "bot", "[stats_rx] TriggerEmitted symbol={}", symbol);
+                    self.logged_trigger_once = true;
+                }
             }
             MetricEvent::TriggerDropLate { symbol, latency_ns } => {
                 self.trigger_drop_late += 1;
@@ -192,15 +239,48 @@ impl Stats {
             MetricEvent::BuyOk { symbol } => {
                 self.buy_ok += 1;
                 self.last_buy_ok = Some(symbol);
+                self.rx_buy_ok_events = self.rx_buy_ok_events.saturating_add(1);
+                if !self.logged_buy_ok_once {
+                    debug!(target: "bot", "[stats_rx] BuyOk symbol={}", symbol);
+                    self.logged_buy_ok_once = true;
+                }
             }
             MetricEvent::BuyErr { symbol } => {
                 self.buy_err += 1;
                 self.last_buy_err = Some(symbol);
             }
-            MetricEvent::TickToSend(metric) => self.record_tick(metric),
+            MetricEvent::TickToSend(metric) => {
+                self.rx_tick_to_send_events = self.rx_tick_to_send_events.saturating_add(1);
+                if !self.logged_tick_once {
+                    debug!(
+                        target: "bot",
+                        "[stats_rx] TickToSend symbol={} price_ns={} trigger_ns={}",
+                        metric.symbol,
+                        metric.price_to_send_ns,
+                        metric.trigger_to_send_ns
+                    );
+                    self.logged_tick_once = true;
+                }
+                self.record_tick(metric);
+            }
             MetricEvent::SignalSuppressed { symbol } => {
                 self.signal_suppressed += 1;
                 self.last_signal_suppressed = Some(symbol);
+            }
+            MetricEvent::RiskFreezeDailyLoss => {
+                self.risk_freeze_daily_loss += 1;
+            }
+            MetricEvent::RiskBanCreated { symbol } => {
+                self.bans_created_30d += 1;
+                self.last_risk_ban = Some(symbol);
+            }
+            MetricEvent::RiskDenyRebuyToday { symbol } => {
+                self.deny_rebuy_today += 1;
+                self.last_deny_rebuy = Some(symbol);
+            }
+            MetricEvent::RiskDenyHaram { symbol } => {
+                self.deny_haram += 1;
+                self.last_deny_haram = Some(symbol);
             }
         }
     }
@@ -271,6 +351,30 @@ impl Stats {
             notes.push(format!("last_signal_suppressed={}", symbol));
         }
 
+        if self.risk_freeze_daily_loss > 0 {
+            notes.push(format!(
+                "risk_freeze_daily_loss={}",
+                self.risk_freeze_daily_loss
+            ));
+        }
+        if self.bans_created_30d > 0 {
+            notes.push(format!("bans_created_30d={}", self.bans_created_30d));
+            if let Some(symbol) = self.last_risk_ban {
+                notes.push(format!("last_ban={}", symbol));
+            }
+        }
+        if self.deny_rebuy_today > 0 {
+            notes.push(format!("deny_rebuy_today={}", self.deny_rebuy_today));
+            if let Some(symbol) = self.last_deny_rebuy {
+                notes.push(format!("last_deny_rebuy={}", symbol));
+            }
+        }
+        if self.deny_haram > 0 {
+            notes.push(format!("deny_haram={}", self.deny_haram));
+            if let Some(symbol) = self.last_deny_haram {
+                notes.push(format!("last_deny_haram={}", symbol));
+            }
+        }
         if notes.is_empty() {
             String::new()
         } else {

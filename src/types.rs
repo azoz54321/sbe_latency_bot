@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use rust_decimal::Decimal;
 
-pub const MAX_SYMBOL_LEN: usize = 16;
+use crate::capital::SlotId;
+
+pub const MAX_SYMBOL_LEN: usize = 32;
 
 pub type SymbolId = u64;
 
@@ -96,14 +98,23 @@ pub struct PriceEvent {
     pub seq: u64,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct ReconnectNotice {
+    pub shard_index: usize,
+    pub ts_mono_ns: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TriggerEvent {
     pub symbol: Symbol,
     pub price_now: f64,
     pub ret_60s: f64,
+    pub price_rx_instant: Instant,
+    pub trigger_instant: Instant,
     pub target_notional: Decimal,
     pub trigger_ts_mono_ns: u64,
     pub signal_ts_mono_ns: u64,
+    pub slot: SlotId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,7 +144,11 @@ pub enum MetricEvent {
     WsMsgIn,
     WsTextIn,
     PriceEventIn,
-    DecodeErr,
+    DecodeOk,
+    DecodeNeedMore,
+    DecodeCorrupt,
+    DecodeSchemaMismatch,
+    DecodeTruncated,
     QueueDropMarket {
         symbol: Symbol,
     },
@@ -160,6 +175,16 @@ pub enum MetricEvent {
     },
     TickToSend(TickToSendMetric),
     SignalSuppressed {
+        symbol: Symbol,
+    },
+    RiskFreezeDailyLoss,
+    RiskBanCreated {
+        symbol: Symbol,
+    },
+    RiskDenyRebuyToday {
+        symbol: Symbol,
+    },
+    RiskDenyHaram {
         symbol: Symbol,
     },
 }

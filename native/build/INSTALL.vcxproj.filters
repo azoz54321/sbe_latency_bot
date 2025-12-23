@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\azoz4\Documents\sbe_latency_bot\native\build\CMakeFiles\8d5eec13cf493abb0a26fcb43bbd660a\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{257034AB-743F-3407-AEA1-F91E4E595A14}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

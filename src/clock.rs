@@ -1,10 +1,10 @@
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 use std::sync::Mutex;
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
 
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
 
@@ -53,7 +53,7 @@ impl Clock for SystemClock {
     }
 }
 
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 #[derive(Debug)]
 pub struct TestClock {
     base_instant: Instant,
@@ -61,7 +61,7 @@ pub struct TestClock {
     offset: Mutex<Duration>,
 }
 
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 impl TestClock {
     pub fn new() -> Self {
         Self::from_datetime(Utc::now())
@@ -100,7 +100,7 @@ impl TestClock {
     }
 }
 
-#[cfg(any(test, feature = "test-mode"))]
+#[cfg(test)]
 impl Clock for TestClock {
     fn now_instant(&self) -> Instant {
         let offset = self.offset.lock().expect("test clock poisoned");
@@ -131,7 +131,7 @@ impl Clock for TestClock {
     }
 }
 
-#[cfg(feature = "test-mode")]
+#[cfg(test)]
 impl Default for TestClock {
     fn default() -> Self {
         Self::new()
