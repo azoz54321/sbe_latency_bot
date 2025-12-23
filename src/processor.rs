@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError, TrySendError};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
+use tracing::info;
 
 use crate::affinity;
 use crate::ahi::AhiHistory;
@@ -14,7 +15,7 @@ use crate::alt_gate::{AhiCalculator, AhiSample, SymbolReturns};
 use crate::capital::CapitalSlots;
 use crate::channels::{SpscReceiver, SpscSender};
 use crate::clock::Clock;
-use crate::config::{Config, ExecutionMode, ServerSpec, ShardAssignment};
+use crate::config::{Config, ExecutionMode, LogProfile, ServerSpec, ShardAssignment};
 use crate::execution::{ExecutionHandle, TargetInfo};
 use crate::fees::{breakeven_px, sl_trigger_px, tp_target_px};
 use crate::gates::{TradingGate, WarmupGate};
@@ -22,7 +23,10 @@ use crate::mode::ModeMachine;
 use crate::positions::{ExitDecision, ExitReason, Position, PositionBook};
 use crate::rings::{abs_return_over, return_over, RingBuffer, RingsHandle, SymbolRings};
 use crate::risk::{RiskEngine, RiskHandle, TradeBlock};
-use crate::types::{LogMessage, MetricEvent, PriceEvent, ReconnectNotice, Symbol, TriggerEvent};
+use crate::types::{
+    LogMessage, MetricEvent, PriceEvent, ReconnectNotice, SignalSuppressReason, Symbol,
+    TriggerEvent,
+};
 use crate::universe::{Universe, UniverseHandle};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
@@ -202,6 +206,7 @@ struct Processor {
     reconnect_rx: Receiver<ReconnectNotice>,
     haram_symbols: HashSet<Symbol>,
     haram_logged: HashSet<Symbol>,
+    diag_next_log: Instant,
 }
 struct ShardChannel {
     receiver: SpscReceiver<PriceEvent>,
@@ -286,14 +291,15 @@ impl Processor {
             next_ahi_compute,
             universe,
             rings,
-            trading_gate,
-            warmup_gate,
-            command_rx,
-            reconnect_rx,
-            haram_symbols,
-            haram_logged: HashSet::new(),
-        }
+        trading_gate,
+        warmup_gate,
+        command_rx,
+        reconnect_rx,
+        haram_symbols,
+        haram_logged: HashSet::new(),
+        diag_next_log: now,
     }
+}
 
     fn run(&mut self) {
         loop {
@@ -304,10 +310,8 @@ impl Processor {
             for idx in 0..self.shards.len() {
                 match self.shards[idx].receiver.try_recv() {
                     Ok(event) => {
-                        let allow_trading =
-                            self.trading_gate.is_enabled() && self.warmup_gate.is_warm();
                         made_progress = true;
-                        self.handle_event(event, allow_trading);
+                        self.handle_event(event);
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => return,
@@ -387,10 +391,11 @@ impl Processor {
         self.last_prices.clear();
         self.benchmarks = Benchmarks::new();
         self.haram_logged.clear();
+        self.diag_next_log = self.clock.now_instant();
         let _ = self.log_tx.send(LogMessage::ResetDaily);
     }
 
-    fn handle_event(&mut self, event: PriceEvent, allow_trading: bool) {
+    fn handle_event(&mut self, event: PriceEvent) {
         let now = self.clock.now_instant();
         if now.duration_since(event.received_instant) > self.queue_age {
             let _ = self.log_tx.send(
@@ -407,15 +412,41 @@ impl Processor {
         self.benchmarks.record(event.symbol, now, event.price);
         self.last_prices.insert(event.symbol, event.price);
 
-        let (ret_60s, symbol_warm) = {
+        let minute_id = if event.event_ts_ms > 0 {
+            Some(event.event_ts_ms / 60_000)
+        } else {
+            None
+        };
+
+        let (trigger_ret, diag_snapshot) = {
             let state = self
                 .symbols
                 .entry(event.symbol)
                 .or_insert_with(|| SymbolState::new(self.config.trigger.window));
             state.rings.record(event_time, event.price);
-            let warm = state.rings.warm(now);
-            (state.rings.ret_60s(), warm)
+            let _ = state.rings.warm(now);
+
+            let ret = minute_id.and_then(|mid| state.minute_ret(mid, event.price));
+            let diag = state.diag_snapshot(minute_id, event.price);
+            (ret, diag)
         };
+
+        if self.config.logging.profile == LogProfile::Verbose && now >= self.diag_next_log {
+            let ret_pct = diag_snapshot.ret_from_open * 100.0;
+            info!(
+                target: "diagnostic",
+                "minute_diag symbol={} raw_ts_ns={} event_ts_ms={} minute_id={:?} open_px={:.8} last_px={:.8} ret_from_open={:.4}% triggered={}",
+                event.symbol,
+                event.exch_ts_ns,
+                event.event_ts_ms,
+                diag_snapshot.minute_id,
+                diag_snapshot.open_price,
+                event.price,
+                ret_pct,
+                diag_snapshot.triggered_this_minute
+            );
+            self.diag_next_log = now + Duration::from_secs(5);
+        }
 
         if let Some(price_dec) = Decimal::from_f64(event.price) {
             if let Some(decision) =
@@ -426,21 +457,20 @@ impl Processor {
             }
         }
 
-        let Some(ret_60s) = ret_60s else {
+        let Some(ret_from_open) = trigger_ret else {
             return;
         };
 
-        if !symbol_warm {
-            return;
-        }
-
-        let ret_threshold = self.config.signal_ret_threshold;
-        if ret_60s < ret_threshold {
+        if ret_from_open < self.config.trigger.trigger_pct {
             return;
         }
 
         if self.positions.contains(event.symbol) || self.capital.contains(event.symbol) {
             return;
+        }
+
+        if let Some(state) = self.symbols.get_mut(&event.symbol) {
+            state.mark_triggered();
         }
 
         let trigger_instant = now;
@@ -452,21 +482,51 @@ impl Processor {
         );
 
         let now_ksa = self.config.ksa_now(self.clock.as_ref());
+        let trading_gate_blocked =
+            self.config.execution.trading_gate_enabled && !self.trading_gate.is_enabled();
+        let warmup_blocked = !self.warmup_gate.is_warm();
 
-        if self.config.execution.mode == ExecutionMode::Live && !allow_trading {
+        if self.config.execution.mode == ExecutionMode::Live && !self.config.execution.live_armed {
             let _ = self.log_tx.send(
                 MetricEvent::SignalSuppressed {
                     symbol: event.symbol,
+                    reason: SignalSuppressReason::NotArmed,
                 }
                 .into(),
             );
             return;
         }
 
-        if self.config.execution.mode == ExecutionMode::Live && !self.mode.is_live() {
+        if self.config.execution.mode == ExecutionMode::Live && trading_gate_blocked {
             let _ = self.log_tx.send(
                 MetricEvent::SignalSuppressed {
                     symbol: event.symbol,
+                    reason: SignalSuppressReason::TradingDisabled,
+                }
+                .into(),
+            );
+            return;
+        }
+
+        if self.config.execution.mode == ExecutionMode::Live && warmup_blocked {
+            let _ = self.log_tx.send(
+                MetricEvent::SignalSuppressed {
+                    symbol: event.symbol,
+                    reason: SignalSuppressReason::Warmup,
+                }
+                .into(),
+            );
+            return;
+        }
+
+        if self.config.execution.mode == ExecutionMode::Live
+            && self.config.execution.live_armed
+            && !self.mode.is_live()
+        {
+            let _ = self.log_tx.send(
+                MetricEvent::SignalSuppressed {
+                    symbol: event.symbol,
+                    reason: SignalSuppressReason::ModeNotLive,
                 }
                 .into(),
             );
@@ -488,6 +548,7 @@ impl Processor {
             let _ = self.log_tx.send(
                 MetricEvent::SignalSuppressed {
                     symbol: event.symbol,
+                    reason: SignalSuppressReason::HaramSymbol,
                 }
                 .into(),
             );
@@ -500,6 +561,7 @@ impl Processor {
                 let _ = self.log_tx.send(
                     MetricEvent::SignalSuppressed {
                         symbol: event.symbol,
+                        reason: SignalSuppressReason::RiskBlocked,
                     }
                     .into(),
                 );
@@ -519,6 +581,7 @@ impl Processor {
             let _ = self.log_tx.send(
                 MetricEvent::SignalSuppressed {
                     symbol: event.symbol,
+                    reason: SignalSuppressReason::NoCapital,
                 }
                 .into(),
             );
@@ -557,7 +620,7 @@ impl Processor {
         let trigger = TriggerEvent {
             symbol: event.symbol,
             price_now: event.price,
-            ret_60s,
+            ret_from_open,
             price_rx_instant: event.received_instant,
             trigger_instant,
             target_notional: self.target_notional,
@@ -897,6 +960,9 @@ enum ProcessorCommand {
 
 struct SymbolState {
     rings: SymbolRings,
+    current_minute_id: Option<u64>,
+    open_price: f64,
+    triggered_this_minute: bool,
 }
 
 impl SymbolState {
@@ -904,12 +970,67 @@ impl SymbolState {
     fn new(window: Duration) -> Self {
         Self {
             rings: SymbolRings::new(window),
+            current_minute_id: None,
+            open_price: 0.0,
+            triggered_this_minute: false,
         }
     }
 
     fn bootstrap(&mut self, now: Instant, price: Option<f64>, hold: Duration) {
         self.rings.bootstrap(now, price, hold);
+        self.current_minute_id = None;
+        self.triggered_this_minute = false;
+        self.open_price = 0.0;
     }
+
+    fn minute_ret(
+        &mut self,
+        minute_id: u64,
+        price: f64,
+    ) -> Option<f64> {
+        if price <= 0.0 {
+            return None;
+        }
+
+        if self.current_minute_id != Some(minute_id) {
+            self.current_minute_id = Some(minute_id);
+            self.open_price = price;
+            self.triggered_this_minute = false;
+        }
+
+        if self.triggered_this_minute || self.open_price <= 0.0 {
+            return None;
+        }
+
+        Some(price / self.open_price - 1.0)
+    }
+
+    fn mark_triggered(&mut self) {
+        self.triggered_this_minute = true;
+    }
+
+    fn diag_snapshot(&self, minute_id: Option<u64>, price: f64) -> DiagSnapshot {
+        let open_price = self.open_price;
+        let ret_from_open = if open_price > 0.0 {
+            price / open_price - 1.0
+        } else {
+            0.0
+        };
+        DiagSnapshot {
+            minute_id: minute_id.or(self.current_minute_id),
+            open_price,
+            ret_from_open,
+            triggered_this_minute: self.triggered_this_minute,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DiagSnapshot {
+    minute_id: Option<u64>,
+    open_price: f64,
+    ret_from_open: f64,
+    triggered_this_minute: bool,
 }
 
 struct Benchmarks {

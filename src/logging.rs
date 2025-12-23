@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerSpec};
-use crate::types::{LogMessage, MetricEvent, Symbol, TickToSendMetric};
+use crate::types::{LogMessage, MetricEvent, SignalSuppressReason, Symbol, TickToSendMetric};
 
 const MAX_TICK_SAMPLES: usize = 2_048;
 
@@ -69,7 +69,13 @@ impl LogAggregator {
     fn handle(&mut self, message: LogMessage) {
         match message {
             LogMessage::Metric(event) => self.stats.apply(event),
-            LogMessage::Info(text) => info!(target: "bot", "{}", text),
+            LogMessage::Info(text) => {
+                if is_trade_message(&text) {
+                    info!(target: "trade", "{}", text);
+                } else {
+                    info!(target: "bot", "{}", text);
+                }
+            }
             LogMessage::Warn(text) => warn!(target: "bot", "{}", text),
             LogMessage::Error(err) => error!(target: "bot", "{}", err),
             LogMessage::ResetDaily => self.stats.reset_daily(),
@@ -109,6 +115,10 @@ impl LogAggregator {
     }
 }
 
+fn is_trade_message(text: &str) -> bool {
+    text.starts_with("[BUY]") || text.starts_with("[SELL]") || text.starts_with("[PAPER")
+}
+
 #[derive(Default)]
 struct Stats {
     ws_in: u64,
@@ -127,6 +137,7 @@ struct Stats {
     buy_ok: u64,
     buy_err: u64,
     signal_suppressed: u64,
+    suppressed_not_armed: u64,
     price_to_send_ms: VecDeque<f64>,
     trigger_to_send_ms: VecDeque<f64>,
     last_queue_drop_market: Option<Symbol>,
@@ -138,6 +149,7 @@ struct Stats {
     last_trigger_emitted: Option<Symbol>,
     last_buy_ok: Option<Symbol>,
     last_signal_suppressed: Option<Symbol>,
+    last_signal_suppressed_reason: Option<SignalSuppressReason>,
     risk_freeze_daily_loss: u64,
     bans_created_30d: u64,
     deny_rebuy_today: u64,
@@ -145,12 +157,6 @@ struct Stats {
     last_risk_ban: Option<Symbol>,
     last_deny_rebuy: Option<Symbol>,
     last_deny_haram: Option<Symbol>,
-    rx_trigger_events: u64,
-    rx_buy_ok_events: u64,
-    rx_tick_to_send_events: u64,
-    logged_trigger_once: bool,
-    logged_buy_ok_once: bool,
-    logged_tick_once: bool,
 }
 
 impl Stats {
@@ -171,6 +177,7 @@ impl Stats {
         self.buy_ok = 0;
         self.buy_err = 0;
         self.signal_suppressed = 0;
+        self.suppressed_not_armed = 0;
         self.price_to_send_ms.clear();
         self.trigger_to_send_ms.clear();
         self.last_queue_drop_market = None;
@@ -182,6 +189,7 @@ impl Stats {
         self.last_trigger_emitted = None;
         self.last_buy_ok = None;
         self.last_signal_suppressed = None;
+        self.last_signal_suppressed_reason = None;
         self.risk_freeze_daily_loss = 0;
         self.bans_created_30d = 0;
         self.deny_rebuy_today = 0;
@@ -189,12 +197,6 @@ impl Stats {
         self.last_risk_ban = None;
         self.last_deny_rebuy = None;
         self.last_deny_haram = None;
-        self.rx_trigger_events = 0;
-        self.rx_buy_ok_events = 0;
-        self.rx_tick_to_send_events = 0;
-        self.logged_trigger_once = false;
-        self.logged_buy_ok_once = false;
-        self.logged_tick_once = false;
     }
 
     fn apply(&mut self, event: MetricEvent) {
@@ -226,11 +228,6 @@ impl Stats {
             MetricEvent::TriggerEmitted { symbol } => {
                 self.trigger_emitted += 1;
                 self.last_trigger_emitted = Some(symbol);
-                self.rx_trigger_events = self.rx_trigger_events.saturating_add(1);
-                if !self.logged_trigger_once {
-                    debug!(target: "bot", "[stats_rx] TriggerEmitted symbol={}", symbol);
-                    self.logged_trigger_once = true;
-                }
             }
             MetricEvent::TriggerDropLate { symbol, latency_ns } => {
                 self.trigger_drop_late += 1;
@@ -239,33 +236,19 @@ impl Stats {
             MetricEvent::BuyOk { symbol } => {
                 self.buy_ok += 1;
                 self.last_buy_ok = Some(symbol);
-                self.rx_buy_ok_events = self.rx_buy_ok_events.saturating_add(1);
-                if !self.logged_buy_ok_once {
-                    debug!(target: "bot", "[stats_rx] BuyOk symbol={}", symbol);
-                    self.logged_buy_ok_once = true;
-                }
             }
             MetricEvent::BuyErr { symbol } => {
                 self.buy_err += 1;
                 self.last_buy_err = Some(symbol);
             }
-            MetricEvent::TickToSend(metric) => {
-                self.rx_tick_to_send_events = self.rx_tick_to_send_events.saturating_add(1);
-                if !self.logged_tick_once {
-                    debug!(
-                        target: "bot",
-                        "[stats_rx] TickToSend symbol={} price_ns={} trigger_ns={}",
-                        metric.symbol,
-                        metric.price_to_send_ns,
-                        metric.trigger_to_send_ns
-                    );
-                    self.logged_tick_once = true;
-                }
-                self.record_tick(metric);
-            }
-            MetricEvent::SignalSuppressed { symbol } => {
+            MetricEvent::TickToSend(metric) => self.record_tick(metric),
+            MetricEvent::SignalSuppressed { symbol, reason } => {
                 self.signal_suppressed += 1;
                 self.last_signal_suppressed = Some(symbol);
+                self.last_signal_suppressed_reason = Some(reason);
+                if matches!(reason, SignalSuppressReason::NotArmed) {
+                    self.suppressed_not_armed += 1;
+                }
             }
             MetricEvent::RiskFreezeDailyLoss => {
                 self.risk_freeze_daily_loss += 1;
@@ -348,7 +331,21 @@ impl Stats {
             notes.push(format!("last_buy_ok={}", symbol));
         }
         if let Some(symbol) = self.last_signal_suppressed {
-            notes.push(format!("last_signal_suppressed={}", symbol));
+            if let Some(reason) = self.last_signal_suppressed_reason {
+                notes.push(format!(
+                    "last_signal_suppressed={} reason={}",
+                    symbol, reason
+                ));
+            } else {
+                notes.push(format!("last_signal_suppressed={}", symbol));
+            }
+        }
+
+        if self.suppressed_not_armed > 0 {
+            notes.push(format!(
+                "suppressed_not_armed={}",
+                self.suppressed_not_armed
+            ));
         }
 
         if self.risk_freeze_daily_loss > 0 {
@@ -380,6 +377,24 @@ impl Stats {
         } else {
             format!(" {}", notes.join(" "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppressed_not_armed_increments_without_buy_err() {
+        let mut stats = Stats::default();
+        stats.apply(MetricEvent::SignalSuppressed {
+            symbol: Symbol::from_str("BTCUSDT").unwrap(),
+            reason: SignalSuppressReason::NotArmed,
+        });
+
+        assert_eq!(stats.signal_suppressed, 1);
+        assert_eq!(stats.suppressed_not_armed, 1);
+        assert_eq!(stats.buy_err, 0);
     }
 }
 

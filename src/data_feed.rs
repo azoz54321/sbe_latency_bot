@@ -26,7 +26,7 @@ pub use schema_guard::{SchemaGuard, SchemaGuardHandle};
 
 use crate::affinity;
 use crate::channels::SpscSender;
-use crate::config::{Config, ShardAssignment};
+use crate::config::{Config, ExecutionMode, ShardAssignment};
 use crate::decoder_sbe::{DecodeStatus, SbeDecoder, MAX_TRADES_PER_FRAME};
 use crate::ffi::BsbeTrade;
 use crate::strategy::shadow::Tick as ShadowTick;
@@ -302,6 +302,9 @@ impl ShardContext {
     }
 
     fn send_shadow_tick(&self, meta: &SymbolMeta, trade: &BsbeTrade) {
+        if self.config.execution.mode != ExecutionMode::Shadow {
+            return;
+        }
         if trade.px_e8 == 0 {
             return;
         }
@@ -777,9 +780,20 @@ fn process_trade(ctx: &ShardContext, trade: &BsbeTrade, last_seq: &mut HashMap<S
         received_instant: now,
         ts_mono_ns: instant_to_ns(now),
         exch_ts_ns: trade.event_ts_ns,
+        event_ts_ms: normalize_ts_to_ms(trade.event_ts_ns),
         seq,
     };
     ctx.emit_price_event(event);
+}
+
+fn normalize_ts_to_ms(raw: u64) -> u64 {
+    if raw >= 10_000_000_000_000_000 {
+        raw / 1_000_000
+    } else if raw >= 10_000_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    }
 }
 
 fn shard_aggregator_loop(

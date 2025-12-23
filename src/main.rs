@@ -13,7 +13,7 @@ use tracing::info;
 
 use sbe_latency_bot::channels::spsc_channel;
 use sbe_latency_bot::clock::{Clock, SystemClock};
-use sbe_latency_bot::config::{Config, ServerId, ShardAssignment};
+use sbe_latency_bot::config::{Config, ExecutionMode, ServerId, ShardAssignment};
 use sbe_latency_bot::data_feed::{self, ShardHandle};
 use sbe_latency_bot::execution::{self, ExecGuards};
 use sbe_latency_bot::filters::FilterCache;
@@ -38,9 +38,8 @@ enum RefreshEvent {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let config = Config::load();
+    init_tracing(config);
     log_config_summary(config);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -83,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     tracing::debug!(
-        "trigger config: trigger_pct={:.6} window_ms={} queue_max_age_ms={} signal_ret_threshold={:.6}",
+        "trigger config: trigger_pct_from_open_1m={:.6} window_ms={} queue_max_age_ms={} signal_ret_threshold={:.6}",
         config.trigger.trigger_pct,
         config.trigger.window.as_millis(),
         config.backpressure.max_queue_age.as_millis(),
@@ -168,8 +167,17 @@ async fn main() -> anyhow::Result<()> {
 
     let (shadow_tx, shadow_rx) = crossbeam_channel::bounded(shadow::CHANNEL_CAPACITY);
     let shadow_drop_counter = Arc::new(AtomicU64::new(0));
-    let _shadow_handle =
-        shadow::spawn_worker(config, clock.clone(), shadow_rx, shadow_drop_counter.clone(), log_tx.clone());
+    let _shadow_handle = if config.execution.mode == ExecutionMode::Shadow {
+        Some(shadow::spawn_worker(
+            config,
+            clock.clone(),
+            shadow_rx,
+            shadow_drop_counter.clone(),
+            log_tx.clone(),
+        ))
+    } else {
+        None
+    };
 
     let mut shard_sources = Vec::with_capacity(shard_plans.len());
     for (assignment, symbols) in shard_plans.iter() {
@@ -442,9 +450,16 @@ fn next_refresh_after(now_utc: DateTime<Utc>) -> (RefreshEvent, DateTime<Utc>) {
     (RefreshEvent::Reset03, next)
 }
 
-fn init_tracing() {
+fn init_tracing(config: &'static Config) {
+    use sbe_latency_bot::config::LogProfile;
+
+    let filter_directive = match config.logging.profile {
+        LogProfile::Verbose => "info",
+        LogProfile::Clean => "warn,trade=info,startup=info",
+    };
+
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+        .or_else(|_| EnvFilter::try_new(filter_directive))
         .expect("failed to create env filter");
 
     let fmt_layer = fmt::layer().with_ansi(false).with_target(false).compact();
@@ -475,12 +490,13 @@ fn fmt_ratio(value: f64) -> String {
 fn log_config_summary(config: &'static Config) {
     let sbe_key_present = !config.credentials.sbe_ws_api_key.is_empty();
     let rest_key_present = !config.credentials.rest_api_key.is_empty();
-    let trading_gate_enabled = false;
     let warmup_secs = config.strategy.warmup_secs;
     info!(
-        "CONFIG SUMMARY mode={:?} trading_gate_enabled={} warmup_secs={} signal_ret_threshold={} trigger_pct={} tp={} sl={} bounce_arm={} daily_loss_freeze={} maker_fee={} taker_fee={} btc_15m_enter={} btc_15m_exit={} sbe_api_key_present={} rest_api_key_present={}",
+        target: "startup",
+        "CONFIG SUMMARY mode={:?} live_armed={} trading_gate_enabled={} warmup_secs={} signal_ret_threshold={} trigger_pct_open_1m={} tp={} sl={} bounce_arm={} daily_loss_freeze={} maker_fee={} taker_fee={} btc_15m_enter={} btc_15m_exit={} logging_profile={:?} sbe_api_key_present={} rest_api_key_present={}",
         config.execution.mode,
-        trading_gate_enabled,
+        config.execution.live_armed,
+        config.execution.trading_gate_enabled,
         warmup_secs,
         fmt_ratio(config.signal_ret_threshold),
         fmt_ratio(config.trigger.trigger_pct),
@@ -492,6 +508,7 @@ fn log_config_summary(config: &'static Config) {
         fmt_ratio(config.strategy.taker_fee_pct.to_f64().unwrap_or(0.0)),
         fmt_ratio(config.strategy.btc_15m_abs_enter),
         fmt_ratio(config.strategy.btc_15m_abs_exit),
+        config.logging.profile,
         sbe_key_present,
         rest_key_present
     );

@@ -94,6 +94,7 @@ pub struct PriceEvent {
     pub ts_mono_ns: u64,
     #[allow(dead_code)]
     pub exch_ts_ns: u64,
+    pub event_ts_ms: u64,
     #[allow(dead_code)]
     pub seq: u64,
 }
@@ -108,7 +109,7 @@ pub struct ReconnectNotice {
 pub struct TriggerEvent {
     pub symbol: Symbol,
     pub price_now: f64,
-    pub ret_60s: f64,
+    pub ret_from_open: f64,
     pub price_rx_instant: Instant,
     pub trigger_instant: Instant,
     pub target_notional: Decimal,
@@ -137,6 +138,32 @@ pub struct TickToSendMetric {
     pub symbol: Symbol,
     pub price_to_send_ns: u64,
     pub trigger_to_send_ns: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SignalSuppressReason {
+    TradingDisabled,
+    ModeNotLive,
+    HaramSymbol,
+    RiskBlocked,
+    NoCapital,
+    NotArmed,
+    Warmup,
+}
+
+impl fmt::Display for SignalSuppressReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            SignalSuppressReason::TradingDisabled => "TradingDisabled",
+            SignalSuppressReason::ModeNotLive => "ModeNotLive",
+            SignalSuppressReason::HaramSymbol => "HaramSymbol",
+            SignalSuppressReason::RiskBlocked => "RiskBlocked",
+            SignalSuppressReason::NoCapital => "NoCapital",
+            SignalSuppressReason::NotArmed => "NotArmed",
+            SignalSuppressReason::Warmup => "Warmup",
+        };
+        write!(f, "{}", label)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -176,6 +203,7 @@ pub enum MetricEvent {
     TickToSend(TickToSendMetric),
     SignalSuppressed {
         symbol: Symbol,
+        reason: SignalSuppressReason,
     },
     RiskFreezeDailyLoss,
     RiskBanCreated {

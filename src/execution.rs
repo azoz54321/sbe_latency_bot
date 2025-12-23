@@ -28,7 +28,8 @@ use crate::rate_limit::TokenBucket;
 use crate::risk::{DisableReason, RiskHandle};
 
 use crate::types::{
-    symbol_id, LogMessage, MetricEvent, OrderIds, Symbol, SymbolId, TickToSendMetric, TriggerEvent,
+    symbol_id, LogMessage, MetricEvent, OrderIds, SignalSuppressReason, Symbol, SymbolId,
+    TickToSendMetric, TriggerEvent,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -294,6 +295,7 @@ impl fmt::Display for OrderSubmitError {
 
 #[derive(Debug)]
 pub enum PlaceOrderError {
+    NotArmed,
     MissingCredentials,
     InvalidPrice,
     InvalidQuantity,
@@ -305,6 +307,7 @@ pub enum PlaceOrderError {
 impl fmt::Display for PlaceOrderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PlaceOrderError::NotArmed => write!(f, "live trading not armed"),
             PlaceOrderError::MissingCredentials => write!(f, "missing REST credentials"),
             PlaceOrderError::InvalidPrice => write!(f, "invalid price"),
             PlaceOrderError::InvalidQuantity => write!(f, "invalid quantity"),
@@ -912,6 +915,15 @@ impl ExecutionEngine {
                         .into(),
                     );
                 }
+                PlaceOrderError::NotArmed => {
+                    let _ = self.log_tx.send(
+                        MetricEvent::SignalSuppressed {
+                            symbol: trigger.symbol,
+                            reason: SignalSuppressReason::NotArmed,
+                        }
+                        .into(),
+                    );
+                }
                 other => {
                     let detail = other
                         .detail()
@@ -936,10 +948,10 @@ impl ExecutionEngine {
         let action_instant = Instant::now();
         let _ = self.log_tx.send(LogMessage::Info(
             format!(
-                "[BUY] SHADOW {} price={:.6} ret60s={:.2}% notional={}",
+                "[BUY] SHADOW {} price={:.6} ret_open={:.2}% notional={}",
                 trigger.symbol,
                 trigger.price_now,
-                trigger.ret_60s * 100.0,
+                trigger.ret_from_open * 100.0,
                 trigger.target_notional
             )
             .into(),
@@ -951,6 +963,10 @@ impl ExecutionEngine {
     }
 
     fn place_buy_and_limit_live(&mut self, trigger: &TriggerEvent) -> ExecResult {
+        if !self.config.execution.live_armed {
+            return Err(PlaceOrderError::NotArmed);
+        }
+
         if self.config.credentials.rest_api_key.is_empty()
             || self.config.credentials.rest_api_secret.is_empty()
         {
@@ -1131,6 +1147,10 @@ impl ExecutionEngine {
         } else {
             None
         };
+
+        if !self.config.execution.live_armed {
+            return Err(PlaceOrderError::NotArmed);
+        }
 
         let action_instant = Instant::now();
         let ids = self

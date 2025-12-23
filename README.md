@@ -27,6 +27,13 @@ cargo build --release
 cargo run --release
 ```
 
+$env:BINANCE_SBE_API_KEY="H57xQl3d5pGXLUQmFvANn7hMmNBJqsUyX2PWszhdytwT0ods3UrZgq60awmaxqzP"
+$env:LOG_PROFILE="clean"
+$env:EXECUTION_MODE="Live"
+$env:LIVE_ARMED="true"
+cargo run --release
+
+
 Architecture Overview
 ---------------------
 | Component | Threads / placement | Notes |

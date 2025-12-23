@@ -64,7 +64,9 @@ impl Config {
                 latency_budget: Duration::from_millis(LATENCY_BUDGET_MS),
             },
             execution: ExecutionConfig {
-                mode: ExecutionMode::Shadow,
+                mode: ExecutionMode::Live,
+                live_armed: load_live_armed(),
+                trading_gate_enabled: TRADING_GATE_ENABLED,
                 order_quote_size_usdt: ORDER_QUOTE_SIZE_USDT,
                 retry_on_fail: RETRY_ON_FAIL,
                 request_timeout: Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS),
@@ -81,6 +83,7 @@ impl Config {
             logging: LoggingConfig {
                 flush_interval: Duration::from_millis(LOG_FLUSH_MS),
                 daily_report_hour_utc: DAILY_REPORT_HOUR_UTC,
+                profile: load_log_profile(),
             },
             strategy: StrategyConfig {
                 warmup_secs: WARMUP_SECS,
@@ -191,6 +194,29 @@ fn load_signal_ret_threshold() -> f64 {
         panic!("SIGNAL_RET_THRESHOLD out of range (0,0.50]: {}", raw);
     }
     raw
+}
+
+fn load_live_armed() -> bool {
+    env::var("LIVE_ARMED")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_log_profile() -> LogProfile {
+    match env::var("LOG_PROFILE")
+        .unwrap_or_else(|_| "clean".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "verbose" => LogProfile::Verbose,
+        _ => LogProfile::Clean,
+    }
 }
 
 #[derive(Debug)]
@@ -309,6 +335,8 @@ pub struct TriggerConfig {
 #[derive(Debug)]
 pub struct ExecutionConfig {
     pub mode: ExecutionMode,
+    pub live_armed: bool,
+    pub trading_gate_enabled: bool,
     pub order_quote_size_usdt: f64,
     pub retry_on_fail: bool,
     pub request_timeout: Duration,
@@ -320,6 +348,12 @@ pub struct ExecutionConfig {
 pub enum ExecutionMode {
     Shadow,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogProfile {
+    Clean,
+    Verbose,
 }
 
 #[derive(Debug)]
@@ -336,6 +370,7 @@ pub struct BackpressureConfig {
 pub struct LoggingConfig {
     pub flush_interval: Duration,
     pub daily_report_hour_utc: u8,
+    pub profile: LogProfile,
 }
 
 #[derive(Debug)]
@@ -411,7 +446,7 @@ const BINANCE_API_SECRET: &str = match option_env!("BINANCE_API_SECRET") {
     None => "",
 };
 
-const DEFAULT_SIGNAL_RET_THRESHOLD: f64 = 0.05;
+const DEFAULT_SIGNAL_RET_THRESHOLD: f64 = 0.005;
 
 const SBE_SHARD_SIZE: usize = 25;
 const SBE_MAX_SHARDS: usize = 15;
@@ -442,10 +477,11 @@ const TRIGGER_PCT: f64 = DEFAULT_SIGNAL_RET_THRESHOLD;
 const WINDOW_MS: u64 = 60_000;
 const LATENCY_BUDGET_MS: u64 = 15;
 
-const ORDER_QUOTE_SIZE_USDT: f64 = 50.0;
+const ORDER_QUOTE_SIZE_USDT: f64 = 9.0;
 const RETRY_ON_FAIL: bool = true;
 const HTTP_REQUEST_TIMEOUT_MS: u64 = 5;
 const REST_RECV_WINDOW_MS: u64 = 500;
+const TRADING_GATE_ENABLED: bool = false;
 
 const DROP_POLICY: &str = "drop_oldest_over_150ms";
 const QUEUE_MAX_AGE_MS: u64 = 150;
