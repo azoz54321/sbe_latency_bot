@@ -32,6 +32,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::fees::tp_target_px;
 use crate::net::backoff;
+use crate::time_sync::TimeSync;
 use crate::types::{LogMessage, Symbol};
 
 use super::{
@@ -60,6 +61,7 @@ impl WsOrderClient {
         log_tx: Sender<LogMessage>,
         bind_core: usize,
         command_tx: Sender<ExecutionCommand>,
+        time_sync: Arc<TimeSync>,
     ) -> Self {
         let (tx, rx) = spsc_channel(COMMAND_QUEUE_CAPACITY);
         thread::Builder::new()
@@ -71,7 +73,8 @@ impl WsOrderClient {
                     .build()
                     .expect("failed to build ws-orders runtime");
                 runtime.block_on(async move {
-                    let mut runner = WsOrderRuntime::new(config, clock, log_tx, rx, command_tx);
+                    let mut runner =
+                        WsOrderRuntime::new(config, clock, log_tx, rx, command_tx, time_sync);
                     runner.run().await;
                 });
             })
@@ -125,6 +128,7 @@ enum ClientCommand {
 struct WsOrderRuntime {
     config: &'static Config,
     clock: Arc<dyn Clock>,
+    time_sync: Arc<TimeSync>,
     log_tx: Sender<LogMessage>,
     rx: SpscReceiver<ClientCommand>,
     pending: HashMap<String, PendingPair>,
@@ -141,11 +145,13 @@ impl WsOrderRuntime {
         log_tx: Sender<LogMessage>,
         rx: SpscReceiver<ClientCommand>,
         command_tx: Sender<ExecutionCommand>,
+        time_sync: Arc<TimeSync>,
     ) -> Self {
-        let recv_window = config.execution.recv_window_ms.min(5_000);
+        let recv_window = config.execution.recv_window_ms.max(5_000);
         Self {
             config,
             clock,
+            time_sync,
             log_tx,
             rx,
             pending: HashMap::new(),
@@ -418,7 +424,7 @@ impl WsOrderRuntime {
         params.push(("symbol".to_string(), order.symbol.as_str().to_string()));
         params.push((
             "timestamp".to_string(),
-            (self.clock.unix_now_ns() / 1_000).to_string(),
+            (self.time_sync.now_ms_synced() * 1_000).to_string(),
         ));
         params.push(("type".to_string(), order.order_type.to_string()));
         let resp_type = if order.order_type.eq_ignore_ascii_case("MARKET") {
@@ -477,7 +483,7 @@ impl WsOrderRuntime {
         params.push(("symbol".to_string(), symbol.as_str().to_string()));
         params.push((
             "timestamp".to_string(),
-            (self.clock.unix_now_ns() / 1_000).to_string(),
+            (self.time_sync.now_ms_synced() * 1_000).to_string(),
         ));
 
         params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1141,6 +1147,7 @@ fn classify_ws_error(code: Option<i64>, msg: &str) -> OrderError {
     }
 
     match code.unwrap_or_default() {
+        -1021 => OrderError::ClockSkew,
         -1013 | -1131 => OrderError::FilterLotStep,
         -1015 | -1003 => OrderError::Transient,
         _ => OrderError::Fatal,

@@ -26,10 +26,11 @@ use crate::metrics::LatencyMetrics;
 use crate::positions::ExitReason;
 use crate::rate_limit::TokenBucket;
 use crate::risk::{DisableReason, RiskHandle};
+use crate::time_sync::TimeSync;
 
 use crate::types::{
-    symbol_id, LogMessage, MetricEvent, OrderIds, SignalSuppressReason, Symbol, SymbolId,
-    TickToSendMetric, TriggerEvent,
+    symbol_id, AccountEvent, LogMessage, MetricEvent, OrderIds, SignalSuppressReason, Symbol,
+    SymbolId, TickToSendMetric, TriggerEvent,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -39,6 +40,8 @@ use ws_orders::WsOrderClient;
 
 const RATE_LIMIT_CAPACITY: u32 = 20;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 20.0;
+const TP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(2000);
+const TP_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 type ExecResult = Result<ExecOutcome, PlaceOrderError>;
 
@@ -109,6 +112,65 @@ impl OrderStatus {
     }
 }
 
+fn verify_or_place_tp(
+    provider: &Arc<dyn ExecutionProvider>,
+    time_sync: &Arc<TimeSync>,
+    log_tx: &Sender<LogMessage>,
+    entry: &mut PendingTp,
+) -> Result<bool, ProviderError> {
+    if provider.find_open_order(entry.limit_order.symbol, &entry.tp_client_id)? {
+        let _ = log_tx.send(LogMessage::Info(
+            format!(
+                "[TP] verified open order cid={} symbol={}",
+                entry.tp_client_id, entry.limit_order.symbol
+            )
+            .into(),
+        ));
+        return Ok(true);
+    }
+
+    if !entry.clock_skew_resynced {
+        let _ = time_sync.resync_blocking();
+        entry.clock_skew_resynced = true;
+        std::thread::sleep(TP_RETRY_DELAY);
+    }
+
+    let order = entry.limit_order.clone();
+    match provider.submit_order(&order) {
+        Ok(id) => {
+            let _ = log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] re-placed tp cid={} oid={} symbol={}",
+                    entry.tp_client_id, id, order.symbol
+                )
+                .into(),
+            ));
+            Ok(false)
+        }
+        Err(err) => {
+            if err.kind == OrderError::ClockSkew {
+                let _ = time_sync.resync_blocking();
+                std::thread::sleep(TP_RETRY_DELAY);
+                match provider.submit_order(&order) {
+                    Ok(id) => {
+                        let _ = log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[TP] re-placed tp after resync cid={} oid={} symbol={}",
+                                entry.tp_client_id, id, order.symbol
+                            )
+                            .into(),
+                        ));
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(ProviderError::fatal(e.to_string())),
+                }
+            } else {
+                Err(ProviderError::fatal(err.to_string()))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OrderFill {
     pub cum_filled: Decimal,
@@ -175,6 +237,11 @@ pub trait ExecutionProvider: Send + Sync {
     fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError>;
     fn cancel_order(&self, symbol: Symbol, order_id: &str) -> Result<CancelOutcome, ProviderError>;
     fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError>;
+    fn find_open_order(
+        &self,
+        symbol: Symbol,
+        client_order_id: &str,
+    ) -> Result<bool, ProviderError>;
 }
 
 #[derive(Clone)]
@@ -259,6 +326,7 @@ pub enum OrderError {
     FilterLotStep,
     FilterMinNotional,
     Transient,
+    ClockSkew,
     Fatal,
 }
 
@@ -357,8 +425,10 @@ pub fn spawn_execution(
     config: &'static Config,
     server: &'static ServerSpec,
     clock: Arc<dyn Clock>,
+    time_sync: Arc<TimeSync>,
     trigger_rx: SpscReceiver<TriggerEvent>,
     log_tx: Sender<LogMessage>,
+    account_tx: Sender<AccountEvent>,
     filter_cache: FilterCache,
     guards: ExecGuards,
     risk: RiskHandle,
@@ -368,19 +438,21 @@ pub fn spawn_execution(
     let engine_guards = guards.clone();
     let engine_risk = risk.clone();
     let provider: Arc<dyn ExecutionProvider> = {
-        let rest = RestExecutionProvider::new(config, clock.clone());
+        let rest = RestExecutionProvider::new(config, time_sync.clone());
         let ws_client = WsOrderClient::spawn(
             config,
             clock.clone(),
             log_tx.clone(),
             server.execution_core,
             cmd_tx.clone(),
+            time_sync.clone(),
         );
         Arc::new(WsExecutionProvider::new(rest, ws_client))
     };
     let provider_for_engine = provider.clone();
     let clock_for_engine = clock.clone();
     let log_tx_engine = log_tx.clone();
+    let account_tx_engine = account_tx.clone();
 
     let handle = thread::Builder::new()
         .name(format!("execution-{:?}", server.id))
@@ -391,6 +463,8 @@ pub fn spawn_execution(
                 clock_for_engine,
                 provider_for_engine,
                 log_tx_engine,
+                time_sync.clone(),
+                account_tx_engine,
                 cmd_rx,
                 engine_filter_cache,
                 engine_guards,
@@ -455,6 +529,12 @@ impl ExecutionHandle {
             .send(ExecutionCommand::RecordLimitFill { symbol });
     }
 
+    pub fn notify_buy_confirmed(&self, buy_client_id: String) {
+        let _ = self
+            .command_tx
+            .send(ExecutionCommand::BuyConfirmed { buy_client_id });
+    }
+
     pub fn submit_close_with_cancel(
         &self,
         symbol: Symbol,
@@ -504,12 +584,17 @@ enum ExecutionCommand {
         new_price: Decimal,
         ticks_diff: u32,
     },
+    BuyConfirmed {
+        buy_client_id: String,
+    },
 }
 
 struct ExecutionEngine {
     config: &'static Config,
     clock: Arc<dyn Clock>,
     log_tx: Sender<LogMessage>,
+    time_sync: Arc<TimeSync>,
+    account_tx: Sender<AccountEvent>,
     latency_budget_ns: u64,
     filter_cache: FilterCache,
     guards: ExecGuards,
@@ -518,7 +603,17 @@ struct ExecutionEngine {
     command_rx: Receiver<ExecutionCommand>,
     provider: Arc<dyn ExecutionProvider>,
     open_limits: HashMap<Symbol, Option<String>>,
+    pending_tp: HashMap<String, PendingTp>,
     target_notional: Decimal,
+}
+
+#[derive(Clone)]
+struct PendingTp {
+    limit_order: ProviderOrder,
+    tp_client_id: String,
+    retries_left: u8,
+    deadline: Instant,
+    clock_skew_resynced: bool,
 }
 
 impl ExecutionEngine {
@@ -528,6 +623,8 @@ impl ExecutionEngine {
         clock: Arc<dyn Clock>,
         provider: Arc<dyn ExecutionProvider>,
         log_tx: Sender<LogMessage>,
+        time_sync: Arc<TimeSync>,
+        account_tx: Sender<AccountEvent>,
         command_rx: Receiver<ExecutionCommand>,
         filter_cache: FilterCache,
         guards: ExecGuards,
@@ -543,6 +640,8 @@ impl ExecutionEngine {
             config,
             clock,
             log_tx,
+            time_sync,
+            account_tx,
             latency_budget_ns,
             filter_cache,
             guards,
@@ -551,6 +650,7 @@ impl ExecutionEngine {
             command_rx,
             provider,
             open_limits: HashMap::new(),
+            pending_tp: HashMap::new(),
             target_notional,
         };
         tracing::debug!(target: "bot", "[BOOT] execution runtime ready");
@@ -560,6 +660,7 @@ impl ExecutionEngine {
     fn run(&mut self, trigger_rx: SpscReceiver<TriggerEvent>) {
         let trigger_rx = trigger_rx.into_inner();
         loop {
+            self.process_pending_tp();
             crossbeam_channel::select! {
                 recv(self.command_rx) -> cmd => match cmd {
                     Ok(command) => self.handle_command(command),
@@ -569,6 +670,9 @@ impl ExecutionEngine {
                     Ok(trigger) => self.handle_trigger(trigger),
                     Err(_) => break,
                 },
+                default(Duration::from_millis(10)) => {
+                    self.process_pending_tp();
+                }
             }
         }
     }
@@ -602,6 +706,52 @@ impl ExecutionEngine {
             } => {
                 self.handle_tp_adjust(symbol, old_order_id, new_order_id, new_price, ticks_diff);
             }
+            ExecutionCommand::BuyConfirmed { buy_client_id } => {
+                self.mark_buy_confirmed(buy_client_id);
+            }
+        }
+    }
+
+    fn mark_buy_confirmed(&mut self, buy_client_id: String) {
+        if let Some(entry) = self.pending_tp.get_mut(&buy_client_id) {
+            entry.deadline = Instant::now() + TP_CONFIRM_TIMEOUT;
+        }
+    }
+
+    fn process_pending_tp(&mut self) {
+        let now = Instant::now();
+        let mut completed = Vec::new();
+        for (buy_id, entry) in self.pending_tp.iter_mut() {
+            if now < entry.deadline {
+                continue;
+            }
+            match verify_or_place_tp(&self.provider, &self.time_sync, &self.log_tx, entry) {
+                Ok(true) => {
+                    completed.push(buy_id.clone());
+                }
+                Ok(false) => {
+                    if entry.retries_left == 0 {
+                        let _ = self.log_tx.send(LogMessage::Error(format!(
+                            "[ALERT] TP not placed; manual intervention required cid={} tp_cid={}",
+                            buy_id, entry.tp_client_id
+                        )));
+                        completed.push(buy_id.clone());
+                    } else {
+                        entry.retries_left -= 1;
+                        entry.deadline = Instant::now() + TP_CONFIRM_TIMEOUT;
+                    }
+                }
+                Err(err) => {
+                    let _ = self.log_tx.send(LogMessage::Warn(format!(
+                        "[EXEC] tp verify failed cid={} err={:?}",
+                        buy_id, err
+                    ).into()));
+                    entry.deadline = Instant::now() + TP_RETRY_DELAY;
+                }
+            }
+        }
+        for key in completed {
+            self.pending_tp.remove(&key);
         }
     }
 
@@ -880,67 +1030,78 @@ impl ExecutionEngine {
                 }
                 self.metrics.maybe_flush();
             }
-            Err(err) => match err {
-                PlaceOrderError::Guard(GuardError::RateLimited) => {
-                    let _ = self.log_tx.send(
-                        MetricEvent::QueueDropTrigger {
-                            symbol: trigger.symbol,
-                        }
-                        .into(),
-                    );
+            Err(err) => {
+                let reason = err
+                    .detail()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| err.to_string());
+                let _ = self.account_tx.send(AccountEvent::LocalReject {
+                    client_order_id: trigger.buy_client_order_id.clone(),
+                    symbol: trigger.symbol,
+                    reason: reason.clone(),
+                });
+                match err {
+                    PlaceOrderError::Guard(GuardError::RateLimited) => {
+                        let _ = self.log_tx.send(
+                            MetricEvent::QueueDropTrigger {
+                                symbol: trigger.symbol,
+                            }
+                            .into(),
+                        );
+                    }
+                    PlaceOrderError::FiltersUnavailable { symbol_id, .. } => {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[WARN] missing filters {} symbol_id={}",
+                                trigger.symbol, symbol_id
+                            )
+                            .into(),
+                        ));
+                        let _ = self.log_tx.send(
+                            MetricEvent::BuyErr {
+                                symbol: trigger.symbol,
+                            }
+                            .into(),
+                        );
+                    }
+                    PlaceOrderError::Guard(GuardError::InFlight) => {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!("[WARN] guard_inflight {}", trigger.symbol).into(),
+                        ));
+                        let _ = self.log_tx.send(
+                            MetricEvent::BuyErr {
+                                symbol: trigger.symbol,
+                            }
+                            .into(),
+                        );
+                    }
+                    PlaceOrderError::NotArmed => {
+                        let _ = self.log_tx.send(
+                            MetricEvent::SignalSuppressed {
+                                symbol: trigger.symbol,
+                                reason: SignalSuppressReason::NotArmed,
+                            }
+                            .into(),
+                        );
+                    }
+                    other => {
+                        let detail = other
+                            .detail()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| other.to_string());
+                        let _ = self.log_tx.send(LogMessage::Error(format!(
+                            "[EXEC] order_error {}: {}",
+                            trigger.symbol, detail
+                        )));
+                        let _ = self.log_tx.send(
+                            MetricEvent::BuyErr {
+                                symbol: trigger.symbol,
+                            }
+                            .into(),
+                        );
+                    }
                 }
-                PlaceOrderError::FiltersUnavailable { symbol_id, .. } => {
-                    let _ = self.log_tx.send(LogMessage::Warn(
-                        format!(
-                            "[WARN] missing filters {} symbol_id={}",
-                            trigger.symbol, symbol_id
-                        )
-                        .into(),
-                    ));
-                    let _ = self.log_tx.send(
-                        MetricEvent::BuyErr {
-                            symbol: trigger.symbol,
-                        }
-                        .into(),
-                    );
-                }
-                PlaceOrderError::Guard(GuardError::InFlight) => {
-                    let _ = self.log_tx.send(LogMessage::Warn(
-                        format!("[WARN] guard_inflight {}", trigger.symbol).into(),
-                    ));
-                    let _ = self.log_tx.send(
-                        MetricEvent::BuyErr {
-                            symbol: trigger.symbol,
-                        }
-                        .into(),
-                    );
-                }
-                PlaceOrderError::NotArmed => {
-                    let _ = self.log_tx.send(
-                        MetricEvent::SignalSuppressed {
-                            symbol: trigger.symbol,
-                            reason: SignalSuppressReason::NotArmed,
-                        }
-                        .into(),
-                    );
-                }
-                other => {
-                    let detail = other
-                        .detail()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| other.to_string());
-                    let _ = self.log_tx.send(LogMessage::Error(format!(
-                        "[EXEC] order_error {}: {}",
-                        trigger.symbol, detail
-                    )));
-                    let _ = self.log_tx.send(
-                        MetricEvent::BuyErr {
-                            symbol: trigger.symbol,
-                        }
-                        .into(),
-                    );
-                }
-            },
+            }
         }
     }
 
@@ -980,7 +1141,7 @@ impl ExecutionEngine {
             .get(symbol_id)
             .ok_or(PlaceOrderError::FiltersUnavailable { symbol, symbol_id })?;
 
-        let _permit = self
+        let permit = self
             .guards
             .enter(symbol_id)
             .map_err(PlaceOrderError::from)?;
@@ -1008,12 +1169,29 @@ impl ExecutionEngine {
                         ));
                     }
 
+                    drop(permit);
+                    self.pending_tp.insert(
+                        trigger.buy_client_order_id.clone(),
+                        PendingTp {
+                            limit_order: outcome.limit_order.clone(),
+                            tp_client_id: outcome.limit_order.client_order_id.clone(),
+                            retries_left: 1,
+                            deadline: Instant::now() + Duration::from_secs(3600),
+                            clock_skew_resynced: false,
+                        },
+                    );
+
                     return Ok(ExecOutcome {
                         ids: outcome.ids,
                         action_instant: outcome.action_instant,
                     });
                 }
                 Err(mut err) => {
+                    if err.order_kind() == Some(OrderError::ClockSkew) {
+                        let _ = self.time_sync.resync_blocking();
+                        std::thread::sleep(TP_RETRY_DELAY);
+                        continue;
+                    }
                     if !auto_heal_used {
                         if err
                             .order_kind()
@@ -1038,7 +1216,7 @@ impl ExecutionEngine {
                                 }
                             }
                         } else if matches!(err.order_kind(), Some(OrderError::Fatal)) {
-                            drop(_permit);
+                            drop(permit);
                             self.disable_symbol(symbol, symbol_id, DisableReason::FatalError);
                             return Err(err);
                         } else {
@@ -1046,7 +1224,7 @@ impl ExecutionEngine {
                         }
                     }
 
-                    drop(_permit);
+                    drop(permit);
                     self.disable_symbol(symbol, symbol_id, DisableReason::OrderReject);
                     return Err(err);
                 }
@@ -1109,11 +1287,7 @@ impl ExecutionEngine {
             quantity_scale: qty_scale,
             price: None,
             price_scale,
-            client_order_id: format!(
-                "{}-buy-{}",
-                trigger.slot.label(),
-                trigger.trigger_ts_mono_ns
-            ),
+            client_order_id: trigger.buy_client_order_id.clone(),
             trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
         };
 
@@ -1125,7 +1299,7 @@ impl ExecutionEngine {
             quantity_scale: qty_scale,
             price: Some(tp_price),
             price_scale,
-            client_order_id: format!("{}-tp-{}", trigger.slot.label(), trigger.trigger_ts_mono_ns),
+            client_order_id: trigger.tp_client_order_id.clone(),
             trigger_ts_mono_ns: trigger.trigger_ts_mono_ns,
         };
 
@@ -1165,6 +1339,7 @@ impl ExecutionEngine {
             qty_scale,
             price_scale,
             action_instant,
+            limit_order,
         })
     }
 
@@ -1199,7 +1374,9 @@ fn align_tick_up(price: Decimal, tick: Decimal) -> Decimal {
 }
 
 fn slot_from_client_id(client_id: &str) -> Option<String> {
-    client_id.split('-').next().map(|value| value.to_string())
+    let mut parts = client_id.split('-');
+    let _ = parts.next();
+    parts.next().map(|value| value.to_string())
 }
 
 fn format_decimal(value: Decimal, decimals: u32) -> String {
@@ -1216,6 +1393,7 @@ struct OrderAttempt {
     qty_scale: u32,
     price_scale: u32,
     action_instant: Instant,
+    limit_order: ProviderOrder,
 }
 
 fn classify_order_error(status: StatusCode, body: &str) -> OrderError {
@@ -1228,6 +1406,9 @@ fn classify_order_error(status: StatusCode, body: &str) -> OrderError {
     }
     if upper.contains("MIN_NOTIONAL") {
         return OrderError::FilterMinNotional;
+    }
+    if upper.contains("-1021") || upper.contains("INVALID TIMESTAMP") {
+        return OrderError::ClockSkew;
     }
 
     if status == StatusCode::TOO_MANY_REQUESTS
@@ -1256,7 +1437,7 @@ fn is_unknown_order(body: &str) -> bool {
 struct RestExecutionProvider {
     config: &'static Config,
     client: Client,
-    clock: Arc<dyn Clock>,
+    time_sync: Arc<TimeSync>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1268,9 +1449,15 @@ struct RestQueryOrderResponse {
     executed_qty: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenOrderRecord {
+    #[serde(rename = "clientOrderId")]
+    client_order_id: String,
+}
+
 impl RestExecutionProvider {
     #[allow(clippy::too_many_arguments)]
-    fn new(config: &'static Config, clock: Arc<dyn Clock>) -> Self {
+    fn new(config: &'static Config, time_sync: Arc<TimeSync>) -> Self {
         let client = Client::builder()
             .tcp_nodelay(true)
             .timeout(config.execution.request_timeout)
@@ -1280,7 +1467,7 @@ impl RestExecutionProvider {
         Self {
             config,
             client,
-            clock,
+            time_sync,
         }
     }
 
@@ -1298,8 +1485,8 @@ impl RestExecutionProvider {
     }
 
     fn signed_order_url(&self, symbol: Symbol, order_id: &str) -> Result<String, ProviderError> {
-        let recv_window = self.config.execution.recv_window_ms;
-        let timestamp_ms = self.clock.unix_now_ns() / 1_000_000;
+        let recv_window = self.config.execution.recv_window_ms.max(5_000);
+        let timestamp_ms = self.time_sync.now_ms_synced();
         let payload = format!(
             "symbol={symbol}&origClientOrderId={order_id}&recvWindow={recv_window}&timestamp={timestamp}",
             symbol = symbol.as_str(),
@@ -1349,8 +1536,8 @@ impl ExecutionProvider for RestExecutionProvider {
     fn submit_order(&self, order: &ProviderOrder) -> Result<String, OrderSubmitError> {
         let api_key = self.config.credentials.rest_api_key;
         let endpoint = format!("{}/api/v3/order", self.config.transport.rest_base_url);
-        let recv_window = self.config.execution.recv_window_ms;
-        let timestamp_ms = self.clock.unix_now_ns() / 1_000_000;
+        let recv_window = self.config.execution.recv_window_ms.max(5_000);
+        let timestamp_ms = self.time_sync.now_ms_synced();
         let symbol_str = order.symbol.as_str();
         let qty_str = format_decimal(order.quantity, order.quantity_scale);
 
@@ -1375,32 +1562,42 @@ impl ExecutionProvider for RestExecutionProvider {
         let signature = self.sign_payload(&payload)?;
         let body = format!("{payload}&signature={signature}");
 
-        let response = self
-            .client
-            .post(&endpoint)
-            .header("X-MBX-APIKEY", api_key)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .map_err(|err| {
-                if err.is_timeout() || err.is_connect() {
-                    OrderSubmitError::new(OrderError::Transient, err.to_string())
-                } else {
-                    OrderSubmitError::new(OrderError::Fatal, err.to_string())
-                }
-            })?;
+        let mut clock_resynced = false;
+        loop {
+            let response = self
+                .client
+                .post(&endpoint)
+                .header("X-MBX-APIKEY", api_key)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .map_err(|err| {
+                    if err.is_timeout() || err.is_connect() {
+                        OrderSubmitError::new(OrderError::Transient, err.to_string())
+                    } else {
+                        OrderSubmitError::new(OrderError::Fatal, err.to_string())
+                    }
+                })?;
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(order.client_order_id.clone());
+            let status = response.status();
+            if status.is_success() {
+                return Ok(order.client_order_id.clone());
+            }
+
+            let body_txt = response.text().unwrap_or_default();
+            let kind = classify_order_error(status, &body_txt);
+            if kind == OrderError::ClockSkew && !clock_resynced {
+                let _ = self.time_sync.resync_blocking();
+                std::thread::sleep(TP_RETRY_DELAY);
+                clock_resynced = true;
+                continue;
+            }
+
+            return Err(OrderSubmitError::new(
+                kind,
+                format!("binance rejected order: status={status} body={body_txt}"),
+            ));
         }
-
-        let body = response.text().unwrap_or_default();
-        let kind = classify_order_error(status, &body);
-        Err(OrderSubmitError::new(
-            kind,
-            format!("binance rejected order: status={status} body={body}"),
-        ))
     }
 
     fn cancel_order(&self, symbol: Symbol, order_id: &str) -> Result<CancelOutcome, ProviderError> {
@@ -1450,6 +1647,54 @@ impl ExecutionProvider for RestExecutionProvider {
         }
         Err(self.http_error("query", status, body))
     }
+
+    fn find_open_order(
+        &self,
+        symbol: Symbol,
+        client_order_id: &str,
+    ) -> Result<bool, ProviderError> {
+        let recv_window = self.config.execution.recv_window_ms.max(5_000);
+        let timestamp_ms = self.time_sync.now_ms_synced();
+        let payload = format!(
+            "symbol={symbol}&recvWindow={recv_window}&timestamp={timestamp}",
+            symbol = symbol.as_str(),
+            recv_window = recv_window,
+            timestamp = timestamp_ms
+        );
+        let signature = self.sign_payload_provider(&payload)?;
+        let url = format!(
+            "{base}/api/v3/openOrders?{payload}&signature={signature}",
+            base = self.config.transport.rest_base_url,
+            payload = payload,
+            signature = signature
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", self.config.credentials.rest_api_key)
+            .send()
+            .map_err(map_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            let orders: Vec<OpenOrderRecord> = response
+                .json()
+                .map_err(|err| ProviderError::fatal(err.to_string()))?;
+            let found = orders
+                .into_iter()
+                .any(|o| o.client_order_id == client_order_id);
+            return Ok(found);
+        }
+        let body = response.text().unwrap_or_default();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if classify_order_error(status, &body) == OrderError::ClockSkew {
+            let _ = self.time_sync.resync_blocking();
+            std::thread::sleep(TP_RETRY_DELAY);
+            return self.find_open_order(symbol, client_order_id);
+        }
+        Err(self.http_error("openOrders", status, body))
+    }
 }
 
 struct WsExecutionProvider {
@@ -1483,5 +1728,13 @@ impl ExecutionProvider for WsExecutionProvider {
 
     fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError> {
         self.rest.query_order(symbol, order_id)
+    }
+
+    fn find_open_order(
+        &self,
+        symbol: Symbol,
+        client_order_id: &str,
+    ) -> Result<bool, ProviderError> {
+        self.rest.find_open_order(symbol, client_order_id)
     }
 }

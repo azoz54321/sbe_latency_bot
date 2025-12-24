@@ -26,8 +26,12 @@ pub struct ModeMachine {
 
 impl ModeMachine {
     pub fn new(config: &'static Config, now: Instant) -> Self {
+        Self::new_with_state(config, Mode::WatchOnly, now)
+    }
+
+    pub fn new_with_state(config: &'static Config, initial: Mode, now: Instant) -> Self {
         Self {
-            state: Mode::WatchOnly,
+            state: initial,
             strategy: &config.strategy,
             ahi: &config.strategy.ahi,
             enter_candidate_since: None,

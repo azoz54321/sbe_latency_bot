@@ -100,16 +100,26 @@ struct SymbolInfo {
 #[serde(tag = "filterType", rename_all = "SCREAMING_SNAKE_CASE")]
 enum SymbolFilter {
     PriceFilter {
-        #[serde(default)]
+        #[serde(default, alias = "tickSize")]
         tick_size: String,
     },
     LotSize {
-        #[serde(default)]
+        #[serde(default, alias = "stepSize")]
         step_size: String,
     },
     MinNotional {
-        #[serde(default)]
+        #[serde(default, alias = "minNotional")]
         min_notional: String,
+    },
+    Notional {
+        #[serde(default, alias = "minNotional")]
+        min_notional: String,
+        #[serde(default, alias = "applyToMarket", alias = "applyMinToMarket")]
+        #[allow(dead_code)]
+        apply_to_market: Option<bool>,
+        #[serde(default, alias = "avgPriceMins")]
+        #[allow(dead_code)]
+        avg_price_mins: Option<i64>,
     },
     #[serde(other)]
     Other,
@@ -119,6 +129,7 @@ fn extract_symbol_filters(filters: &[SymbolFilter]) -> anyhow::Result<SymbolFilt
     let mut step = None;
     let mut tick = None;
     let mut min_notional = None;
+    let mut legacy_min_notional = None;
 
     for filter in filters {
         match filter {
@@ -132,16 +143,26 @@ fn extract_symbol_filters(filters: &[SymbolFilter]) -> anyhow::Result<SymbolFilt
                     step = Decimal::from_str(step_size).ok();
                 }
             }
-            SymbolFilter::MinNotional {
+            SymbolFilter::Notional {
                 min_notional: value,
+                ..
             } => {
                 if min_notional.is_none() {
                     min_notional = Decimal::from_str(value).ok();
                 }
             }
+            SymbolFilter::MinNotional {
+                min_notional: value,
+            } => {
+                if legacy_min_notional.is_none() {
+                    legacy_min_notional = Decimal::from_str(value).ok();
+                }
+            }
             SymbolFilter::Other => {}
         }
     }
+
+    let min_notional = min_notional.or(legacy_min_notional);
 
     match (step, tick, min_notional) {
         (Some(step), Some(tick), Some(min_notional))

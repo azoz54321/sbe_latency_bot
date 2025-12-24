@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerSpec};
+use crate::hot_counters::{HotCounters, HotSnapshot};
 use crate::types::{LogMessage, MetricEvent, SignalSuppressReason, Symbol, TickToSendMetric};
 
 const MAX_TICK_SAMPLES: usize = 2_048;
@@ -13,13 +15,14 @@ const MAX_TICK_SAMPLES: usize = 2_048;
 pub fn spawn_log_aggregator(
     config: &'static Config,
     rx: Receiver<LogMessage>,
+    hot: Arc<HotCounters>,
 ) -> thread::JoinHandle<()> {
     let server_spec = config.active_server_spec();
 
     thread::Builder::new()
         .name("log-aggregator".to_string())
         .spawn(move || {
-            let mut aggregator = LogAggregator::new(config, server_spec, rx);
+            let mut aggregator = LogAggregator::new(config, server_spec, rx, hot);
             aggregator.run();
         })
         .expect("failed to spawn log aggregator")
@@ -29,12 +32,19 @@ struct LogAggregator {
     config: &'static Config,
     server: &'static ServerSpec,
     rx: Receiver<LogMessage>,
+    hot: Arc<HotCounters>,
     stats: Stats,
     last_flush: Instant,
+    last_hot: HotSnapshot,
 }
 
 impl LogAggregator {
-    fn new(config: &'static Config, server: &'static ServerSpec, rx: Receiver<LogMessage>) -> Self {
+    fn new(
+        config: &'static Config,
+        server: &'static ServerSpec,
+        rx: Receiver<LogMessage>,
+        hot: Arc<HotCounters>,
+    ) -> Self {
         debug!(
             target: "bot",
             "log aggregator ready: active_server={:?} log_flush={}ms",
@@ -46,8 +56,10 @@ impl LogAggregator {
             config,
             server,
             rx,
+            hot,
             stats: Stats::default(),
             last_flush: Instant::now(),
+            last_hot: HotSnapshot::default(),
         }
     }
 
@@ -85,19 +97,23 @@ impl LogAggregator {
     fn flush_summary(&mut self) {
         let (price_p50, price_p95) = self.stats.price_latency_percentiles();
         let (trigger_p50, trigger_p95) = self.stats.trigger_latency_percentiles();
+        let cur_hot = self.hot.snapshot();
+        let delta_hot = cur_hot.saturating_sub(&self.last_hot);
+        self.last_hot = cur_hot;
 
         info!(
             target: "bot",
-            "stats server={:?} ws_in={} ws_text_in={} price_in={} decode_ok={} decode_need_more={} decode_corrupt={} decode_schema_mismatch={} decode_truncated={} triggers={} late={} queue_drop_market={} queue_drop_trigger={} seq_anomaly={} buy_ok={} buy_err={} suppressed={} price_to_send_ms_p50={:.2} p95={:.2} trigger_to_send_ms_p50={:.2} p95={:.2}{}",
+            "stats server={:?} ws_in={} ws_text_in={} price_in={} decode_ok={} decode_need_more={} decode_corrupt={} decode_schema_mismatch={} decode_truncated={} drop_skew={} triggers={} late={} queue_drop_market={} queue_drop_trigger={} seq_anomaly={} buy_ok={} buy_err={} suppressed={} price_to_send_ms_p50={:.2} p95={:.2} trigger_to_send_ms_p50={:.2} p95={:.2}{}",
             self.server.id,
-            self.stats.ws_in,
-            self.stats.ws_text_in,
-            self.stats.price_in,
-            self.stats.decode_ok,
-            self.stats.decode_need_more,
-            self.stats.decode_corrupt,
-            self.stats.decode_schema_mismatch,
-            self.stats.decode_truncated,
+            delta_hot.ws_in,
+            delta_hot.ws_text_in,
+            delta_hot.price_in,
+            delta_hot.decode_ok,
+            delta_hot.decode_need_more,
+            delta_hot.decode_corrupt,
+            delta_hot.decode_schema_mismatch,
+            delta_hot.decode_truncated,
+            delta_hot.drop_skew,
             self.stats.trigger_emitted,
             self.stats.trigger_drop_late,
             self.stats.queue_drop_market,
@@ -121,14 +137,6 @@ fn is_trade_message(text: &str) -> bool {
 
 #[derive(Default)]
 struct Stats {
-    ws_in: u64,
-    ws_text_in: u64,
-    price_in: u64,
-    decode_ok: u64,
-    decode_need_more: u64,
-    decode_corrupt: u64,
-    decode_schema_mismatch: u64,
-    decode_truncated: u64,
     queue_drop_market: u64,
     queue_drop_trigger: u64,
     seq_anomaly: u64,
@@ -161,14 +169,6 @@ struct Stats {
 
 impl Stats {
     fn reset_daily(&mut self) {
-        self.ws_in = 0;
-        self.ws_text_in = 0;
-        self.price_in = 0;
-        self.decode_ok = 0;
-        self.decode_need_more = 0;
-        self.decode_corrupt = 0;
-        self.decode_schema_mismatch = 0;
-        self.decode_truncated = 0;
         self.queue_drop_market = 0;
         self.queue_drop_trigger = 0;
         self.seq_anomaly = 0;
@@ -201,14 +201,14 @@ impl Stats {
 
     fn apply(&mut self, event: MetricEvent) {
         match event {
-            MetricEvent::WsMsgIn => self.ws_in += 1,
-            MetricEvent::WsTextIn => self.ws_text_in += 1,
-            MetricEvent::PriceEventIn => self.price_in += 1,
-            MetricEvent::DecodeOk => self.decode_ok += 1,
-            MetricEvent::DecodeNeedMore => self.decode_need_more += 1,
-            MetricEvent::DecodeCorrupt => self.decode_corrupt += 1,
-            MetricEvent::DecodeSchemaMismatch => self.decode_schema_mismatch += 1,
-            MetricEvent::DecodeTruncated => self.decode_truncated += 1,
+            MetricEvent::WsMsgIn
+            | MetricEvent::WsTextIn
+            | MetricEvent::PriceEventIn
+            | MetricEvent::DecodeOk
+            | MetricEvent::DecodeNeedMore
+            | MetricEvent::DecodeCorrupt
+            | MetricEvent::DecodeSchemaMismatch
+            | MetricEvent::DecodeTruncated => {}
             MetricEvent::QueueDropMarket { symbol } => {
                 self.queue_drop_market += 1;
                 self.last_queue_drop_market = Some(symbol);

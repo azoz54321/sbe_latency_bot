@@ -1,4 +1,5 @@
-use std::time::Instant;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::types::Symbol;
 
@@ -17,26 +18,64 @@ impl SlotId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SlotPhase {
+    Idle,
+    PendingSend,
+    ReservedOnAccount,
+    PositionOpen,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OrderRole {
+    Buy,
+    TakeProfit,
+}
+
+#[derive(Debug, Clone)]
 struct SlotState {
-    occupied: bool,
     symbol: Option<Symbol>,
-    reserved_at: Option<Instant>,
+    phase: SlotPhase,
+    buy_client_id: Option<String>,
+    tp_client_id: Option<String>,
+    order_id: Option<String>,
+    pending_since: Option<Instant>,
 }
 
 impl SlotState {
     fn new() -> Self {
         Self {
-            occupied: false,
             symbol: None,
-            reserved_at: None,
+            phase: SlotPhase::Idle,
+            buy_client_id: None,
+            tp_client_id: None,
+            order_id: None,
+            pending_since: None,
         }
     }
+
+    fn reset(&mut self) {
+        self.symbol = None;
+        self.phase = SlotPhase::Idle;
+        self.buy_client_id = None;
+        self.tp_client_id = None;
+        self.order_id = None;
+        self.pending_since = None;
+    }
+}
+
+#[derive(Debug)]
+pub struct PendingTimeout {
+    pub slot: SlotId,
+    pub symbol: Symbol,
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct CapitalSlots {
     slots: [SlotState; 2],
+    client_lookup: HashMap<String, (SlotId, OrderRole)>,
+    pending_timeout: Duration,
 }
 
 #[allow(clippy::new_without_default)]
@@ -44,15 +83,46 @@ impl CapitalSlots {
     pub fn new() -> Self {
         Self {
             slots: [SlotState::new(), SlotState::new()],
+            client_lookup: HashMap::new(),
+            pending_timeout: Duration::from_secs(5),
         }
     }
 
-    pub fn try_reserve_slot(&mut self, now: Instant, symbol: Symbol) -> Option<SlotId> {
+    pub fn try_begin_pending(
+        &mut self,
+        now: Instant,
+        symbol: Symbol,
+        buy_client_id: String,
+        tp_client_id: String,
+    ) -> Option<SlotId> {
+        self.expire_pending(now);
         for (idx, slot) in self.slots.iter_mut().enumerate() {
-            if !slot.occupied {
-                slot.occupied = true;
+            if slot.phase == SlotPhase::Idle {
+                slot.phase = SlotPhase::PendingSend;
                 slot.symbol = Some(symbol);
-                slot.reserved_at = Some(now);
+                slot.buy_client_id = Some(buy_client_id.clone());
+                slot.tp_client_id = Some(tp_client_id.clone());
+                slot.order_id = None;
+                slot.pending_since = Some(now);
+
+                let slot_id = match idx {
+                    0 => SlotId::A,
+                    _ => SlotId::B,
+                };
+                self.client_lookup
+                    .insert(buy_client_id, (slot_id, OrderRole::Buy));
+                self.client_lookup
+                    .insert(tp_client_id, (slot_id, OrderRole::TakeProfit));
+                return Some(slot_id);
+            }
+        }
+        None
+    }
+
+    pub fn first_idle_slot(&mut self, now: Instant) -> Option<SlotId> {
+        self.expire_pending(now);
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if slot.phase == SlotPhase::Idle {
                 return Some(match idx {
                     0 => SlotId::A,
                     _ => SlotId::B,
@@ -62,30 +132,160 @@ impl CapitalSlots {
         None
     }
 
-    pub fn release_slot(&mut self, slot_id: SlotId) {
-        match slot_id {
-            SlotId::A => self.reset_slot(0),
-            SlotId::B => self.reset_slot(1),
+    pub fn begin_pending_on_slot(
+        &mut self,
+        now: Instant,
+        slot_id: SlotId,
+        symbol: Symbol,
+        buy_client_id: String,
+        tp_client_id: String,
+    ) -> bool {
+        self.expire_pending(now);
+        let Some(idx) = self.slot_index(slot_id) else {
+            return false;
+        };
+        let slot = &mut self.slots[idx];
+        if slot.phase != SlotPhase::Idle {
+            return false;
         }
+        slot.phase = SlotPhase::PendingSend;
+        slot.symbol = Some(symbol);
+        slot.buy_client_id = Some(buy_client_id.clone());
+        slot.tp_client_id = Some(tp_client_id.clone());
+        slot.order_id = None;
+        slot.pending_since = Some(now);
+        self.client_lookup
+            .insert(buy_client_id, (slot_id, OrderRole::Buy));
+        self.client_lookup
+            .insert(tp_client_id, (slot_id, OrderRole::TakeProfit));
+        true
+    }
+
+    pub fn mark_reserved(
+        &mut self,
+        client_order_id: &str,
+        order_id: Option<String>,
+        now: Instant,
+    ) -> Option<(SlotId, Symbol)> {
+        let (slot_id, _) = self.client_lookup.get(client_order_id).copied()?;
+        let idx = self.slot_index(slot_id)?;
+        let slot = &mut self.slots[idx];
+        if let Some(symbol) = slot.symbol {
+            slot.phase = SlotPhase::ReservedOnAccount;
+            slot.order_id = order_id;
+            slot.pending_since = Some(now);
+            return Some((slot_id, symbol));
+        }
+        None
+    }
+
+    pub fn mark_position_open(
+        &mut self,
+        client_order_id: &str,
+        order_id: Option<String>,
+    ) -> Option<(SlotId, Symbol)> {
+        let (slot_id, _) = self.client_lookup.get(client_order_id).copied()?;
+        let idx = self.slot_index(slot_id)?;
+        let slot = &mut self.slots[idx];
+        if let Some(symbol) = slot.symbol {
+            slot.phase = SlotPhase::PositionOpen;
+            slot.order_id = order_id;
+            return Some((slot_id, symbol));
+        }
+        None
+    }
+
+    pub fn release_by_client(&mut self, client_order_id: &str) -> Option<(SlotId, Symbol)> {
+        let (slot_id, _) = self.client_lookup.get(client_order_id).copied()?;
+        self.release_slot(slot_id)
+    }
+
+    pub fn release_slot(&mut self, slot_id: SlotId) -> Option<(SlotId, Symbol)> {
+        let idx = self.slot_index(slot_id)?;
+        let symbol = self.slots[idx].symbol;
+        self.remove_mappings_for_slot(slot_id);
+        self.slots[idx].reset();
+        symbol.map(|sym| (slot_id, sym))
     }
 
     pub fn contains(&self, symbol: Symbol) -> bool {
         self.slots
             .iter()
-            .any(|slot| slot.occupied && slot.symbol == Some(symbol))
+            .any(|slot| slot.symbol == Some(symbol) && slot.phase != SlotPhase::Idle)
     }
 
     pub fn reset_daily(&mut self) {
         for slot in &mut self.slots {
-            slot.reserved_at = None;
+            slot.reset();
+        }
+        self.client_lookup.clear();
+    }
+
+    pub fn expire_pending(&mut self, now: Instant) -> Vec<PendingTimeout> {
+        let mut released = Vec::new();
+        for idx in 0..self.slots.len() {
+            let slot = &self.slots[idx];
+            if slot.phase != SlotPhase::PendingSend {
+                continue;
+            }
+            let Some(start) = slot.pending_since else {
+                continue;
+            };
+            if now.duration_since(start) < self.pending_timeout {
+                continue;
+            }
+            let slot_id = match idx {
+                0 => SlotId::A,
+                _ => SlotId::B,
+            };
+            if let Some(symbol) = slot.symbol {
+                let buy_id = slot.buy_client_id.clone();
+                released.push(PendingTimeout {
+                    slot: slot_id,
+                    symbol,
+                    client_order_id: buy_id,
+                });
+            }
+            self.remove_mappings_for_slot(slot_id);
+            if let Some(slot) = self.slots.get_mut(idx) {
+                slot.reset();
+            }
+        }
+        released
+    }
+
+    pub fn slot_for_client(&self, client_order_id: &str) -> Option<(SlotId, OrderRole)> {
+        self.client_lookup.get(client_order_id).copied()
+    }
+
+    pub fn reserved_only(&self) -> bool {
+        self.slots.iter().all(|slot| {
+            matches!(
+                slot.phase,
+                SlotPhase::ReservedOnAccount | SlotPhase::PositionOpen
+            )
+        })
+    }
+
+    pub fn tp_client_id(&self, slot_id: SlotId) -> Option<String> {
+        let idx = self.slot_index(slot_id)?;
+        self.slots[idx].tp_client_id.clone()
+    }
+
+    pub fn buy_client_id(&self, slot_id: SlotId) -> Option<String> {
+        let idx = self.slot_index(slot_id)?;
+        self.slots[idx].buy_client_id.clone()
+    }
+
+    fn slot_index(&self, slot_id: SlotId) -> Option<usize> {
+        match slot_id {
+            SlotId::A => Some(0),
+            SlotId::B => Some(1),
         }
     }
 
-    fn reset_slot(&mut self, idx: usize) {
-        if let Some(slot) = self.slots.get_mut(idx) {
-            slot.occupied = false;
-            slot.symbol = None;
-            slot.reserved_at = None;
-        }
+    fn remove_mappings_for_slot(&mut self, slot_id: SlotId) {
+        self.client_lookup
+            .retain(|_, (mapped, _)| *mapped != slot_id);
     }
 }

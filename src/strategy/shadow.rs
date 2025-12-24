@@ -138,20 +138,25 @@ impl ShadowWorker {
                                 tick.symbol, jump_pct, price, tick.ts_ns
                             );
                             let trigger_instant = Instant::now();
-                            let _ = self
-                                .log_tx
-                                .send(MetricEvent::TriggerEmitted { symbol: tick.symbol }.into());
+                            let _ = self.log_tx.send(
+                                MetricEvent::TriggerEmitted {
+                                    symbol: tick.symbol,
+                                }
+                                .into(),
+                            );
 
                             let position = Position::new(price, tick.ts_ns);
                             let action_instant = Instant::now();
                             let price_to_send_ns = action_instant
                                 .checked_duration_since(tick.rx_instant)
                                 .unwrap_or_default()
-                                .as_nanos() as u64;
+                                .as_nanos()
+                                as u64;
                             let trigger_to_send_ns = action_instant
                                 .checked_duration_since(trigger_instant)
                                 .unwrap_or_default()
-                                .as_nanos() as u64;
+                                .as_nanos()
+                                as u64;
                             println!(
                                 "[PAPER-OPEN] symbol={} entry={:.8} target={:.8} stop={:.8}",
                                 tick.symbol, position.entry_px, position.target, position.stop
@@ -211,7 +216,8 @@ impl ShadowWorker {
         if let Some(mut close) = outcome {
             self.apply_close(tick.symbol, tick.ts_ns, close.entry_ts_ns, close.reason);
             close.window.push(tick.ts_ns, price);
-            self.states.insert(tick.symbol, SymState::Flat(close.window));
+            self.states
+                .insert(tick.symbol, SymState::Flat(close.window));
         }
     }
 

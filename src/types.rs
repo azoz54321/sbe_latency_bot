@@ -116,6 +116,8 @@ pub struct TriggerEvent {
     pub trigger_ts_mono_ns: u64,
     pub signal_ts_mono_ns: u64,
     pub slot: SlotId,
+    pub buy_client_order_id: String,
+    pub tp_client_order_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -221,4 +223,57 @@ impl From<MetricEvent> for LogMessage {
     fn from(metric: MetricEvent) -> Self {
         LogMessage::Metric(metric)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountExecutionReport {
+    pub symbol: Symbol,
+    pub side: String,
+    pub order_type: String,
+    pub status: String,
+    pub exec_type: String,
+    pub client_order_id: String,
+    pub orig_client_order_id: Option<String>,
+    pub order_id: Option<String>,
+    pub price: Decimal,
+    pub orig_qty: Decimal,
+    pub cum_qty: Decimal,
+    pub last_qty: Decimal,
+    pub last_price: Decimal,
+    pub commission_asset: Option<String>,
+    pub commission: Option<Decimal>,
+    pub reject_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BalanceSnapshot {
+    pub asset: String,
+    pub free: Decimal,
+    pub locked: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenOrderSnapshot {
+    pub client_order_id: String,
+    pub symbol: Symbol,
+    pub side: String,
+    pub status: String,
+    pub price: Decimal,
+    pub orig_qty: Decimal,
+    pub executed_qty: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub enum AccountEvent {
+    Execution(AccountExecutionReport),
+    OutboundAccountPosition { balances: Vec<BalanceSnapshot> },
+    BalanceUpdate { asset: String, delta: Decimal },
+    AccountSnapshot { balances: Vec<BalanceSnapshot> },
+    OpenOrders(Vec<OpenOrderSnapshot>),
+    LocalReject {
+        client_order_id: String,
+        symbol: Symbol,
+        reason: String,
+    },
+    StreamClosed,
 }

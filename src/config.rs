@@ -31,6 +31,7 @@ pub struct Config {
 
 impl Config {
     fn new() -> Self {
+        let signal = load_signal_ret_threshold();
         Self {
             transport: TransportConfig {
                 sbe_ws_url: SBE_WS_URL,
@@ -57,9 +58,9 @@ impl Config {
                 active_server: ServerId::ServerA,
                 servers: &SERVER_SPECS,
             },
-            signal_ret_threshold: load_signal_ret_threshold(),
+            signal_ret_threshold: signal,
             trigger: TriggerConfig {
-                trigger_pct: TRIGGER_PCT,
+                trigger_pct: signal,
                 window: Duration::from_millis(WINDOW_MS),
                 latency_budget: Duration::from_millis(LATENCY_BUDGET_MS),
             },
@@ -75,6 +76,7 @@ impl Config {
             backpressure: BackpressureConfig {
                 drop_policy: DROP_POLICY,
                 max_queue_age: Duration::from_millis(QUEUE_MAX_AGE_MS),
+                max_exch_skew: Duration::from_millis(EXCH_TS_MAX_SKEW_MS),
                 ws_ping_p95_threshold: Duration::from_millis(WS_PING_P95_THRESHOLD_MS),
                 ws_ping_sustain: Duration::from_secs(WS_PING_SUSTAIN_SECS),
                 latency_p95_warning: LATENCY_P95_WARNING_MS,
@@ -360,6 +362,7 @@ pub enum LogProfile {
 pub struct BackpressureConfig {
     pub drop_policy: &'static str,
     pub max_queue_age: Duration,
+    pub max_exch_skew: Duration,
     pub ws_ping_p95_threshold: Duration,
     pub ws_ping_sustain: Duration,
     pub latency_p95_warning: f64,
@@ -446,7 +449,7 @@ const BINANCE_API_SECRET: &str = match option_env!("BINANCE_API_SECRET") {
     None => "",
 };
 
-const DEFAULT_SIGNAL_RET_THRESHOLD: f64 = 0.005;
+const DEFAULT_SIGNAL_RET_THRESHOLD: f64 = 0.0005;
 
 const SBE_SHARD_SIZE: usize = 25;
 const SBE_MAX_SHARDS: usize = 15;
@@ -473,7 +476,6 @@ const SERVER_SPECS: [ServerSpec; 2] = [
 
 const USE_MULTI_SERVER: bool = true;
 
-const TRIGGER_PCT: f64 = DEFAULT_SIGNAL_RET_THRESHOLD;
 const WINDOW_MS: u64 = 60_000;
 const LATENCY_BUDGET_MS: u64 = 15;
 
@@ -484,7 +486,8 @@ const REST_RECV_WINDOW_MS: u64 = 500;
 const TRADING_GATE_ENABLED: bool = false;
 
 const DROP_POLICY: &str = "drop_oldest_over_150ms";
-const QUEUE_MAX_AGE_MS: u64 = 150;
+const QUEUE_MAX_AGE_MS: u64 = 350;
+const EXCH_TS_MAX_SKEW_MS: u64 = 5_000;
 const WS_PING_P95_THRESHOLD_MS: u64 = 200;
 const WS_PING_SUSTAIN_SECS: u64 = 30;
 const LATENCY_P95_WARNING_MS: f64 = 15.0;

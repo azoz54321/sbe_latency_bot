@@ -12,20 +12,20 @@ use tracing::info;
 use crate::affinity;
 use crate::ahi::AhiHistory;
 use crate::alt_gate::{AhiCalculator, AhiSample, SymbolReturns};
-use crate::capital::CapitalSlots;
+use crate::capital::{CapitalSlots, OrderRole, SlotId};
 use crate::channels::{SpscReceiver, SpscSender};
 use crate::clock::Clock;
 use crate::config::{Config, ExecutionMode, LogProfile, ServerSpec, ShardAssignment};
 use crate::execution::{ExecutionHandle, TargetInfo};
 use crate::fees::{breakeven_px, sl_trigger_px, tp_target_px};
 use crate::gates::{TradingGate, WarmupGate};
-use crate::mode::ModeMachine;
+use crate::mode::{Mode, ModeMachine};
 use crate::positions::{ExitDecision, ExitReason, Position, PositionBook};
 use crate::rings::{abs_return_over, return_over, RingBuffer, RingsHandle, SymbolRings};
 use crate::risk::{RiskEngine, RiskHandle, TradeBlock};
 use crate::types::{
-    LogMessage, MetricEvent, PriceEvent, ReconnectNotice, SignalSuppressReason, Symbol,
-    TriggerEvent,
+    AccountEvent, AccountExecutionReport, BalanceSnapshot, LogMessage, MetricEvent, PriceEvent,
+    ReconnectNotice, SignalSuppressReason, Symbol, TriggerEvent,
 };
 use crate::universe::{Universe, UniverseHandle};
 
@@ -43,6 +43,7 @@ pub fn spawn_processor(
     warmup_gate: Arc<WarmupGate>,
     shard_inputs: Vec<(ShardAssignment, SpscReceiver<PriceEvent>)>,
     reconnect_rx: Receiver<ReconnectNotice>,
+    account_rx: Receiver<AccountEvent>,
     trigger_tx: SpscSender<TriggerEvent>,
     log_tx: Sender<LogMessage>,
 ) -> (thread::JoinHandle<()>, ProcessorHandle) {
@@ -75,6 +76,7 @@ pub fn spawn_processor(
                     cmd_rx,
                     risk_engine,
                     reconnect_rx,
+                    account_rx,
                 );
                 processor.run();
             }
@@ -204,12 +206,29 @@ struct Processor {
     warmup_gate: Arc<WarmupGate>,
     command_rx: Receiver<ProcessorCommand>,
     reconnect_rx: Receiver<ReconnectNotice>,
+    account_rx: Receiver<AccountEvent>,
     haram_symbols: HashSet<Symbol>,
     haram_logged: HashSet<Symbol>,
     diag_next_log: Instant,
+    balances: HashMap<String, BalanceSnapshot>,
+    client_ids: ClientOrderIdGen,
 }
 struct ShardChannel {
     receiver: SpscReceiver<PriceEvent>,
+}
+
+#[derive(Debug, Default)]
+struct ClientOrderIdGen {
+    seq: u64,
+}
+
+impl ClientOrderIdGen {
+    fn next(&mut self, slot: SlotId, symbol: Symbol, clock: &dyn Clock) -> (String, String) {
+        self.seq = self.seq.wrapping_add(1);
+        let ts_ms = clock.unix_now_ns() / 1_000_000;
+        let base = format!("SBELAT-{}-{}-{ts_ms}-{}", slot.label(), symbol, self.seq);
+        (base.clone(), format!("{base}-TP"))
+    }
 }
 
 impl Processor {
@@ -227,6 +246,7 @@ impl Processor {
         command_rx: Receiver<ProcessorCommand>,
         risk: RiskEngine,
         reconnect_rx: Receiver<ReconnectNotice>,
+        account_rx: Receiver<AccountEvent>,
     ) -> Self {
         let mut shard_symbols = HashMap::new();
         let shards = shard_inputs
@@ -253,7 +273,18 @@ impl Processor {
             config.strategy.ahi.breadth_pos_threshold_bp,
             config.strategy.ahi.ethbtc_linear_fullscale_bp,
         );
-        let mode = ModeMachine::new(config, now);
+        let armed_live =
+            config.execution.mode == ExecutionMode::Live && config.execution.live_armed;
+        let initial_mode = if armed_live {
+            Mode::LiveTrading
+        } else {
+            Mode::WatchOnly
+        };
+        let mode = ModeMachine::new_with_state(config, initial_mode, now);
+        info!(target: "bot", "ModeMachine initial_state={:?}", initial_mode);
+        if armed_live {
+            info!(target: "bot", "ModeNotLive gate override active (Live+Armed)");
+        }
         let capital = CapitalSlots::new();
         let positions = PositionBook::new();
 
@@ -291,20 +322,25 @@ impl Processor {
             next_ahi_compute,
             universe,
             rings,
-        trading_gate,
-        warmup_gate,
-        command_rx,
-        reconnect_rx,
-        haram_symbols,
-        haram_logged: HashSet::new(),
-        diag_next_log: now,
+            trading_gate,
+            warmup_gate,
+            command_rx,
+            reconnect_rx,
+            account_rx,
+            haram_symbols,
+            haram_logged: HashSet::new(),
+            diag_next_log: now,
+            balances: HashMap::new(),
+            client_ids: ClientOrderIdGen::default(),
+        }
     }
-}
 
     fn run(&mut self) {
         loop {
             self.drain_commands();
             self.drain_reconnects();
+            self.drain_account_events();
+            self.handle_pending_timeouts();
 
             let mut made_progress = false;
             for idx in 0..self.shards.len() {
@@ -336,6 +372,28 @@ impl Processor {
     fn drain_reconnects(&mut self) {
         while let Ok(notice) = self.reconnect_rx.try_recv() {
             self.handle_reconnect(notice);
+        }
+    }
+
+    fn drain_account_events(&mut self) {
+        while let Ok(event) = self.account_rx.try_recv() {
+            self.handle_account_event(event);
+        }
+    }
+
+    fn handle_pending_timeouts(&mut self) {
+        let now = self.clock.now_instant();
+        let timeouts = self.capital.expire_pending(now);
+        for timeout in timeouts {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[ACCT] pending_timeout slot={} symbol={} cid={:?}",
+                    timeout.slot.label(),
+                    timeout.symbol,
+                    timeout.client_order_id
+                )
+                .into(),
+            ));
         }
     }
 
@@ -383,6 +441,34 @@ impl Processor {
         }
     }
 
+    fn handle_account_event(&mut self, event: AccountEvent) {
+        match event {
+            AccountEvent::Execution(report) => self.handle_execution_report(report),
+            AccountEvent::OutboundAccountPosition { balances } => {
+                self.handle_outbound_balances(balances)
+            }
+            AccountEvent::BalanceUpdate { asset, delta } => {
+                self.handle_balance_update(asset, delta)
+            }
+            AccountEvent::AccountSnapshot { balances } => {
+                self.handle_balance_snapshot(balances)
+            }
+            AccountEvent::OpenOrders(orders) => self.handle_open_orders(orders),
+            AccountEvent::LocalReject {
+                client_order_id,
+                symbol,
+                reason,
+            } => {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!("[ACCT] local_reject cid={} symbol={} reason={}", client_order_id, symbol, reason).into(),
+                ));
+                let _ = self.capital.release_by_client(&client_order_id);
+                self.positions.close(symbol);
+            }
+            AccountEvent::StreamClosed => {}
+        }
+    }
+
     fn reset_daily_components(&mut self) {
         self.capital.reset_daily();
         self.risk.reset_daily_counters_keep_long_bans();
@@ -392,9 +478,253 @@ impl Processor {
         self.benchmarks = Benchmarks::new();
         self.haram_logged.clear();
         self.diag_next_log = self.clock.now_instant();
+        self.balances.clear();
+        self.client_ids = ClientOrderIdGen::default();
         let _ = self.log_tx.send(LogMessage::ResetDaily);
     }
 
+    fn handle_execution_report(&mut self, report: AccountExecutionReport) {
+        self.log_execution_report(&report);
+        let status_upper = report.status.to_ascii_uppercase();
+        let client_id = if self
+            .capital
+            .slot_for_client(&report.client_order_id)
+            .is_some()
+        {
+            report.client_order_id.clone()
+        } else {
+            report
+                .orig_client_order_id
+                .clone()
+                .unwrap_or_else(|| report.client_order_id.clone())
+        };
+        let role_lookup = self
+            .capital
+            .slot_for_client(&client_id);
+
+        let Some((slot, role)) = role_lookup else {
+            return;
+        };
+
+        if status_upper == "NEW" {
+            let _ = self
+                .capital
+                .mark_reserved(&client_id, report.order_id.clone(), self.clock.now_instant());
+            if let OrderRole::Buy = role {
+                if let Some(execution) = self.execution.as_ref() {
+                    execution.notify_buy_confirmed(client_id.clone());
+                }
+            }
+            return;
+        }
+
+        if status_upper == "PARTIALLY_FILLED" || status_upper == "FILLED" {
+            let _ = self
+                .capital
+                .mark_position_open(&client_id, report.order_id.clone());
+            match role {
+                OrderRole::Buy => {
+                    self.ensure_position_open(slot, &report);
+                    if let Some(execution) = self.execution.as_ref() {
+                        execution.notify_buy_confirmed(client_id.clone());
+                    }
+                }
+                OrderRole::TakeProfit => {
+                    if status_upper == "FILLED" {
+                        self.close_position_from_tp(&report);
+                    }
+                }
+            }
+            return;
+        }
+
+        if status_upper == "REJECTED" || status_upper == "CANCELED" || status_upper == "EXPIRED" {
+            if let Some((_, symbol)) = self.capital.release_by_client(&client_id) {
+                self.positions.close(symbol);
+            }
+            return;
+        }
+    }
+
+    fn ensure_position_open(&mut self, slot: SlotId, report: &AccountExecutionReport) {
+        let qty = if report.cum_qty > Decimal::ZERO {
+            report.cum_qty
+        } else {
+            report.last_qty
+        };
+        if qty <= Decimal::ZERO {
+            return;
+        }
+        let entry_price = if report.last_price > Decimal::ZERO {
+            report.last_price
+        } else {
+            report.price
+        };
+        if entry_price <= Decimal::ZERO {
+            return;
+        }
+        let strategy = &self.config.strategy;
+        let take_profit = tp_target_px(
+            entry_price,
+            strategy.tp_pct,
+            strategy.maker_fee_pct,
+            strategy.taker_fee_pct,
+        );
+        let stop_loss = sl_trigger_px(
+            entry_price,
+            strategy.sl_pct,
+            strategy.maker_fee_pct,
+            strategy.taker_fee_pct,
+        );
+        let bounce_break_even = breakeven_px(
+            entry_price,
+            strategy.maker_fee_pct,
+            strategy.taker_fee_pct,
+        );
+        let tp_order_id = self.capital.tp_client_id(slot);
+        let now = self.clock.now_instant();
+        let already_open = self.positions.contains(report.symbol);
+        self.positions.open(
+            report.symbol,
+            qty,
+            entry_price,
+            slot,
+            now,
+            take_profit,
+            stop_loss,
+            bounce_break_even,
+            tp_order_id,
+            qty,
+        );
+        if !already_open {
+            let now_ksa = self.config.ksa_now(self.clock.as_ref());
+            self.risk.mark_trade_open(report.symbol, now_ksa);
+        }
+    }
+
+    fn close_position_from_tp(&mut self, report: &AccountExecutionReport) {
+        let exit_price = if report.last_price > Decimal::ZERO {
+            report.last_price
+        } else {
+            report.price
+        };
+        if let Some(position) = self.positions.close(report.symbol) {
+            self.finalize_exit(position, exit_price, ExitReason::TakeProfitLimit);
+        }
+    }
+
+    fn handle_outbound_balances(&mut self, balances: Vec<BalanceSnapshot>) {
+        for bal in balances {
+            match self.balances.get(&bal.asset) {
+                Some(prev) => {
+                    let delta_free = bal.free - prev.free;
+                    let delta_locked = bal.locked - prev.locked;
+                    if delta_free != Decimal::ZERO || delta_locked != Decimal::ZERO {
+                        self.log_balance_change(&bal.asset, &bal, Some((delta_free, delta_locked)));
+                    }
+                }
+                None => {
+                    self.log_balance_change(&bal.asset, &bal, None);
+                }
+            }
+            self.balances.insert(bal.asset.clone(), bal);
+        }
+    }
+
+    fn handle_balance_update(&mut self, asset: String, delta: Decimal) {
+        let entry = self.balances.entry(asset.clone()).or_insert(BalanceSnapshot {
+            asset: asset.clone(),
+            free: Decimal::ZERO,
+            locked: Decimal::ZERO,
+        });
+        entry.free += delta;
+        let snapshot = entry.clone();
+        self.log_balance_change(&asset, &snapshot, Some((delta, Decimal::ZERO)));
+    }
+
+    fn handle_balance_snapshot(&mut self, balances: Vec<BalanceSnapshot>) {
+        let initial = self.balances.is_empty();
+        for bal in balances {
+            let delta = self.balances.get(&bal.asset).map(|prev| {
+                (
+                    bal.free - prev.free,
+                    bal.locked - prev.locked,
+                )
+            });
+            if initial || delta.as_ref().map(|(df, dl)| *df != Decimal::ZERO || *dl != Decimal::ZERO).unwrap_or(true) {
+                self.log_balance_change(&bal.asset, &bal, delta);
+            }
+            self.balances.insert(bal.asset.clone(), bal);
+        }
+    }
+
+    fn handle_open_orders(&mut self, orders: Vec<crate::types::OpenOrderSnapshot>) {
+        if orders.is_empty() {
+            return;
+        }
+        let managed: Vec<_> = orders
+            .iter()
+            .filter(|o| o.client_order_id.starts_with("SBELAT-"))
+            .collect();
+        let external = orders.len().saturating_sub(managed.len());
+        let _ = self.log_tx.send(LogMessage::Info(
+            format!(
+                "[ACCT] open_orders total={} managed={} external={}",
+                orders.len(),
+                managed.len(),
+                external
+            )
+            .into(),
+        ));
+    }
+
+    fn log_balance_change(
+        &self,
+        asset: &str,
+        bal: &BalanceSnapshot,
+        delta: Option<(Decimal, Decimal)>,
+    ) {
+        let mut msg = format!(
+            "[ACCT] BAL asset={} free={} locked={}",
+            asset, bal.free, bal.locked
+        );
+        if let Some((df, dl)) = delta {
+            msg.push_str(&format!(" (Δfree={} Δlocked={})", df, dl));
+        }
+        let _ = self.log_tx.send(LogMessage::Info(msg.into()));
+    }
+
+    fn log_execution_report(&self, report: &AccountExecutionReport) {
+        let mut parts = Vec::new();
+        parts.push(format!("symbol={}", report.symbol));
+        parts.push(format!("side={}", report.side));
+        parts.push(format!("status={}", report.status));
+        parts.push(format!("exec_type={}", report.exec_type));
+        parts.push(format!("cid={}", report.client_order_id));
+        if let Some(orig) = &report.orig_client_order_id {
+            parts.push(format!("orig_cid={orig}"));
+        }
+        if let Some(order_id) = &report.order_id {
+            parts.push(format!("oid={order_id}"));
+        }
+        parts.push(format!("price={}", report.price));
+        parts.push(format!("orig_qty={}", report.orig_qty));
+        parts.push(format!("cum_qty={}", report.cum_qty));
+        parts.push(format!("last_qty={}", report.last_qty));
+        parts.push(format!("last_px={}", report.last_price));
+        if let Some(fee) = report.commission {
+            if let Some(asset) = &report.commission_asset {
+                parts.push(format!("fee={fee} {asset}"));
+            } else {
+                parts.push(format!("fee={fee}"));
+            }
+        }
+        if let Some(reason) = &report.reject_reason {
+            parts.push(format!("reason={reason}"));
+        }
+        let line = format!("[ACCT] ORDER {}", parts.join(" "));
+        let _ = self.log_tx.send(LogMessage::Info(line.into()));
+    }
     fn handle_event(&mut self, event: PriceEvent) {
         let now = self.clock.now_instant();
         if now.duration_since(event.received_instant) > self.queue_age {
@@ -485,6 +815,8 @@ impl Processor {
         let trading_gate_blocked =
             self.config.execution.trading_gate_enabled && !self.trading_gate.is_enabled();
         let warmup_blocked = !self.warmup_gate.is_warm();
+        let armed_live =
+            self.config.execution.mode == ExecutionMode::Live && self.config.execution.live_armed;
 
         if self.config.execution.mode == ExecutionMode::Live && !self.config.execution.live_armed {
             let _ = self.log_tx.send(
@@ -519,9 +851,7 @@ impl Processor {
             return;
         }
 
-        if self.config.execution.mode == ExecutionMode::Live
-            && self.config.execution.live_armed
-            && !self.mode.is_live()
+        if self.config.execution.mode == ExecutionMode::Live && !armed_live && !self.mode.is_live()
         {
             let _ = self.log_tx.send(
                 MetricEvent::SignalSuppressed {
@@ -577,45 +907,30 @@ impl Processor {
             }
         }
 
-        let Some(slot) = self.capital.try_reserve_slot(now, event.symbol) else {
-            let _ = self.log_tx.send(
-                MetricEvent::SignalSuppressed {
-                    symbol: event.symbol,
-                    reason: SignalSuppressReason::NoCapital,
-                }
-                .into(),
-            );
+        let Some(slot) = self.capital.first_idle_slot(now) else {
+            if self.capital.reserved_only() {
+                let _ = self.log_tx.send(
+                    MetricEvent::SignalSuppressed {
+                        symbol: event.symbol,
+                        reason: SignalSuppressReason::NoCapital,
+                    }
+                    .into(),
+                );
+            }
             return;
         };
 
-        let Some(entry_price_dec) = Decimal::from_f64(event.price) else {
-            self.capital.release_slot(slot);
-            return;
-        };
-        let quantity_estimate = self.estimate_quantity(event.price);
-        if quantity_estimate <= Decimal::ZERO {
-            self.capital.release_slot(slot);
+        let (buy_client_order_id, tp_client_order_id) =
+            self.client_ids.next(slot, event.symbol, self.clock.as_ref());
+        if !self.capital.begin_pending_on_slot(
+            now,
+            slot,
+            event.symbol,
+            buy_client_order_id.clone(),
+            tp_client_order_id.clone(),
+        ) {
             return;
         }
-
-        let strategy = &self.config.strategy;
-        let take_profit = tp_target_px(
-            entry_price_dec,
-            strategy.tp_pct,
-            strategy.maker_fee_pct,
-            strategy.taker_fee_pct,
-        );
-        let stop_loss = sl_trigger_px(
-            entry_price_dec,
-            strategy.sl_pct,
-            strategy.maker_fee_pct,
-            strategy.taker_fee_pct,
-        );
-        let bounce_break_even = breakeven_px(
-            entry_price_dec,
-            strategy.maker_fee_pct,
-            strategy.taker_fee_pct,
-        );
 
         let trigger = TriggerEvent {
             symbol: event.symbol,
@@ -627,27 +942,16 @@ impl Processor {
             trigger_ts_mono_ns: self.clock.instant_to_ns(trigger_instant),
             signal_ts_mono_ns: event.ts_mono_ns,
             slot,
+            buy_client_order_id,
+            tp_client_order_id,
         };
 
         match self.trigger_tx.try_send(trigger.clone()) {
             Ok(()) => {
-                let tp_order_id = format!("{}-tp-{}", slot.label(), trigger.trigger_ts_mono_ns);
-                self.positions.open(
-                    event.symbol,
-                    quantity_estimate,
-                    entry_price_dec,
-                    slot,
-                    now,
-                    take_profit,
-                    stop_loss,
-                    bounce_break_even,
-                    Some(tp_order_id),
-                    quantity_estimate,
-                );
-                self.risk.mark_trade_open(event.symbol, now_ksa);
+                // Reserved on account once execution reports are received.
             }
             Err(TrySendError::Full(_)) => {
-                self.capital.release_slot(slot);
+                let _ = self.capital.release_slot(slot);
                 let _ = self.log_tx.send(
                     MetricEvent::QueueDropTrigger {
                         symbol: event.symbol,
@@ -656,23 +960,12 @@ impl Processor {
                 );
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.capital.release_slot(slot);
+                let _ = self.capital.release_slot(slot);
                 let _ = self.log_tx.send(LogMessage::Error(
                     "trigger channel disconnected".to_string(),
                 ));
             }
         }
-    }
-
-    fn estimate_quantity(&self, price: f64) -> Decimal {
-        if price <= 0.0 {
-            return Decimal::ZERO;
-        }
-        let price_dec = Decimal::from_f64(price).unwrap_or(Decimal::ZERO);
-        if price_dec <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        (self.target_notional / price_dec).max(Decimal::ZERO)
     }
 
     fn process_exit_decision(&mut self, symbol: Symbol, price: Decimal, decision: ExitDecision) {
@@ -743,7 +1036,7 @@ impl Processor {
     }
 
     fn finalize_exit(&mut self, position: Position, exit_price: Decimal, reason: ExitReason) {
-        self.capital.release_slot(position.slot);
+        let _ = self.capital.release_slot(position.slot);
 
         let strat = &self.config.strategy;
         let qty = position.qty;
@@ -983,11 +1276,7 @@ impl SymbolState {
         self.open_price = 0.0;
     }
 
-    fn minute_ret(
-        &mut self,
-        minute_id: u64,
-        price: f64,
-    ) -> Option<f64> {
+    fn minute_ret(&mut self, minute_id: u64, price: f64) -> Option<f64> {
         if price <= 0.0 {
             return None;
         }

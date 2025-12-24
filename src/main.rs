@@ -14,10 +14,12 @@ use tracing::info;
 use sbe_latency_bot::channels::spsc_channel;
 use sbe_latency_bot::clock::{Clock, SystemClock};
 use sbe_latency_bot::config::{Config, ExecutionMode, ServerId, ShardAssignment};
+use sbe_latency_bot::account_stream;
 use sbe_latency_bot::data_feed::{self, ShardHandle};
 use sbe_latency_bot::execution::{self, ExecGuards};
 use sbe_latency_bot::filters::FilterCache;
 use sbe_latency_bot::gates::{TradingGate, WarmupGate};
+use sbe_latency_bot::hot_counters::HotCounters;
 use sbe_latency_bot::logging;
 use sbe_latency_bot::private_stream::UserStreamService;
 use sbe_latency_bot::processor;
@@ -25,6 +27,7 @@ use sbe_latency_bot::reset;
 use sbe_latency_bot::rings::{Rings, RingsHandle};
 use sbe_latency_bot::strategy::shadow;
 use sbe_latency_bot::universe::{self, load_haram_list, SymbolKey, UniverseHandle};
+use sbe_latency_bot::time_sync::TimeSync;
 
 const SHADOW_SHARD_SIZE: usize = 120;
 const HARAM_LIST_PATH: &str = "config/haram.list";
@@ -42,6 +45,8 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(config);
     log_config_summary(config);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let time_sync = Arc::new(TimeSync::new(config.transport.rest_base_url)?);
+    time_sync.clone().spawn_poll(Duration::from_secs(30));
 
     let initial_universe = match universe::build_universe(config, clock.as_ref()).await {
         Ok(universe) => {
@@ -158,8 +163,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (log_tx, log_rx) = bounded(config.channel.log_capacity);
-    let log_handle = logging::spawn_log_aggregator(config, log_rx);
+    let hot = Arc::new(HotCounters::default());
+    let log_handle = logging::spawn_log_aggregator(config, log_rx, hot.clone());
     let _user_stream = UserStreamService::maybe_spawn(config, log_tx.clone());
+    let (account_tx, account_rx) = crossbeam_channel::unbounded();
+    let _account_stream =
+        account_stream::spawn_account_stream(config, account_tx.clone(), log_tx.clone(), time_sync.clone());
     let (reconnect_tx, reconnect_rx) = crossbeam_channel::unbounded();
 
     let mut shard_receivers = Vec::with_capacity(shard_plans.len());
@@ -203,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         warmup_gate.clone(),
         shard_receivers,
         reconnect_rx,
+        account_rx,
         trigger_tx,
         log_tx.clone(),
     );
@@ -224,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             assignment,
             market_tx,
             log_tx.clone(),
+            hot.clone(),
             schema_guard.handle(),
             reconnect_tx.clone(),
             strategy_tx,
@@ -254,8 +265,10 @@ async fn main() -> anyhow::Result<()> {
         config,
         server_spec,
         clock.clone(),
+        time_sync.clone(),
         trigger_rx,
         log_tx.clone(),
+        account_tx.clone(),
         filter_cache.clone(),
         exec_guards.clone(),
         risk_handle.clone(),

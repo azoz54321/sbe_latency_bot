@@ -160,6 +160,25 @@ impl PositionBook {
         tp_order_id: Option<String>,
         tp_order_qty: Decimal,
     ) {
+        if let Some(existing) = self.positions.get_mut(&symbol) {
+            existing.slot = slot;
+            existing.qty = qty;
+            existing.entry_price = entry_price;
+            existing.entry_ts = now;
+            existing.bounce_armed = false;
+            existing.closing = false;
+            existing.take_profit = take_profit;
+            existing.stop_loss = stop_loss;
+            existing.bounce_break_even = bounce_break_even;
+            existing.tp_order_id = tp_order_id.clone();
+            existing.tp_order_qty = tp_order_qty;
+            existing.tp_initial_price = take_profit;
+            existing.tp_current_price = take_profit;
+            existing.high_water = entry_price.max(existing.high_water);
+            existing.tp_adjust_done = false;
+            return;
+        }
+
         let position = Position::new(
             symbol,
             qty,

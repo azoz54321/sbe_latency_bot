@@ -29,6 +29,7 @@ use crate::channels::SpscSender;
 use crate::config::{Config, ExecutionMode, ShardAssignment};
 use crate::decoder_sbe::{DecodeStatus, SbeDecoder, MAX_TRADES_PER_FRAME};
 use crate::ffi::BsbeTrade;
+use crate::hot_counters::HotCounters;
 use crate::strategy::shadow::Tick as ShadowTick;
 use crate::time_utils::{instant_to_ns, wall_clock_now_ns};
 use crate::types::{LogMessage, MetricEvent, PriceEvent, ReconnectNotice, Symbol};
@@ -55,6 +56,7 @@ pub fn spawn_shard_reader(
     assignment: ShardAssignment,
     market_tx: SpscSender<PriceEvent>,
     log_tx: Sender<LogMessage>,
+    hot: Arc<HotCounters>,
     schema_guard: SchemaGuardHandle,
     reconnect_tx: Sender<ReconnectNotice>,
     shadow_tx: Sender<ShadowTick>,
@@ -82,12 +84,13 @@ pub fn spawn_shard_reader(
         config,
         shard_index,
         log_tx_for_ctx,
+        hot,
         schema_guard,
         reconnect_tx,
         shadow_tx,
         shadow_drop_counter,
         ing_tx,
-        config.backpressure.max_queue_age.as_nanos() as u64,
+        config.backpressure.max_exch_skew.as_nanos() as u64,
         control_tx,
     );
 
@@ -113,12 +116,13 @@ pub struct ShardContext {
     config: &'static Config,
     shard_index: usize,
     log_tx: Sender<LogMessage>,
+    hot: Arc<HotCounters>,
     schema_guard: SchemaGuardHandle,
     reconnect_tx: Sender<ReconnectNotice>,
     shadow_tx: Sender<ShadowTick>,
     shadow_drop_counter: Arc<AtomicU64>,
     ingest_tx: IngestTx,
-    max_skew_ns: u64,
+    max_exch_skew_ns: u64,
     symbols: Arc<DashMap<Symbol, SymbolMeta>>,
     control_tx: UnboundedSender<ControlMessage>,
     control_id: AtomicU64,
@@ -191,24 +195,26 @@ impl ShardContext {
         config: &'static Config,
         shard_index: usize,
         log_tx: Sender<LogMessage>,
+        hot: Arc<HotCounters>,
         schema_guard: SchemaGuardHandle,
         reconnect_tx: Sender<ReconnectNotice>,
         shadow_tx: Sender<ShadowTick>,
         shadow_drop_counter: Arc<AtomicU64>,
         ingest_tx: IngestTx,
-        max_skew_ns: u64,
+        max_exch_skew_ns: u64,
         control_tx: UnboundedSender<ControlMessage>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
             shard_index,
             log_tx,
+            hot,
             schema_guard,
             reconnect_tx,
             shadow_tx,
             shadow_drop_counter,
             ingest_tx,
-            max_skew_ns,
+            max_exch_skew_ns,
             symbols: Arc::new(DashMap::new()),
             control_tx,
             control_id: AtomicU64::new(1),
@@ -370,6 +376,7 @@ async fn run_shard_stream(
     let mut last_seq: HashMap<Symbol, u64> = HashMap::new();
     let mut pending_controls: VecDeque<ControlMessage> = VecDeque::new();
     let mut pending: Vec<u8> = Vec::new();
+    let mut trades: Vec<BsbeTrade> = Vec::with_capacity(MAX_TRADES_PER_FRAME);
     let mut logged_need_more = false;
     let mut last_status_log: Option<Instant> = None;
 
@@ -452,27 +459,57 @@ async fn run_shard_stream(
                                     if ctx.schema_guard.is_paused() {
                                         continue;
                                     }
-                                    ctx.log_tx.send(MetricEvent::WsMsgIn.into()).ok();
+                                    ctx.hot.ws_in.fetch_add(1, Ordering::Relaxed);
                                     log_sbe_header_once(&payload);
                                     pending.extend_from_slice(&payload);
                                     if pending.len() > MAX_PENDING_BYTES {
-                                        ctx.log_tx
-                                            .send(MetricEvent::DecodeCorrupt.into())
-                                            .ok();
+                                        ctx.hot
+                                            .decode_corrupt
+                                            .fetch_add(1, Ordering::Relaxed);
                                         pending.clear();
                                         continue;
                                     }
 
-                                    let pending_len_before = pending.len();
-                                    let head_before = hex_head(&pending);
-                                    let header_before = parse_header(&pending);
-
-                                    let mut trades: Vec<BsbeTrade> =
-                                        Vec::with_capacity(MAX_TRADES_PER_FRAME);
+                                    trades.clear();
                                     let (report, consumed) = decoder.decode_stream_with_pending(
                                         &pending,
                                         |trade| trades.push(*trade),
                                     );
+
+                                    let status = report.status;
+                                    let now = Instant::now();
+                                    let should_log_status = match last_status_log {
+                                        None => true,
+                                        Some(prev) => now.duration_since(prev) > Duration::from_secs(5),
+                                    };
+                                    let need_pending_for_need_more =
+                                        matches!(status, DecodeStatus::Incomplete)
+                                            && !logged_need_more;
+                                    let pending_len_before =
+                                        if status != DecodeStatus::Complete
+                                            && (should_log_status || need_pending_for_need_more)
+                                        {
+                                            Some(pending.len())
+                                        } else {
+                                            None
+                                        };
+
+                                    if status != DecodeStatus::Complete && should_log_status {
+                                        let head_before = hex_head(&pending);
+                                        let header_before = parse_header(&pending);
+                                        let pending_bytes =
+                                            pending_len_before.unwrap_or_else(|| pending.len());
+                                        last_status_log = Some(now);
+                                        tracing::debug!(
+                                            "[SBE] status={:?} shard={} pending_bytes={} consumed={} head={} header={:?}",
+                                            status,
+                                            ctx.shard_index,
+                                            pending_bytes,
+                                            consumed,
+                                            head_before,
+                                            header_before
+                                        );
+                                    }
 
                                     if consumed > 0 {
                                         pending.drain(0..consumed);
@@ -482,57 +519,41 @@ async fn run_shard_stream(
                                         process_trade(&ctx, trade, &mut last_seq);
                                     }
 
-                                    let status = report.status;
-                                    let now = Instant::now();
-                                    let should_log_status = match last_status_log {
-                                        None => true,
-                                        Some(prev) => now.duration_since(prev) > Duration::from_secs(5),
-                                    };
-
-                                    if status != DecodeStatus::Complete && should_log_status {
-                                        last_status_log = Some(now);
-                                        tracing::debug!(
-                                            "[SBE] status={:?} shard={} pending_bytes={} consumed={} head={} header={:?}",
-                                            status,
-                                            ctx.shard_index,
-                                            pending_len_before,
-                                            consumed,
-                                            head_before,
-                                            header_before
-                                        );
-                                    }
-
                                     match status {
                                         DecodeStatus::Complete => {
-                                            ctx.log_tx.send(MetricEvent::DecodeOk.into()).ok();
+                                            ctx.hot.decode_ok.fetch_add(1, Ordering::Relaxed);
                                             logged_need_more = false;
                                         }
                                         DecodeStatus::Incomplete => {
-                                            ctx.log_tx.send(MetricEvent::DecodeNeedMore.into()).ok();
-                                            if !logged_need_more {
-                                                tracing::debug!(
-                                                    "[SBE] need_more shard={} pending_bytes={}",
-                                                    ctx.shard_index,
-                                                    pending_len_before
-                                                );
-                                                logged_need_more = true;
-                                            }
+                                            ctx.hot
+                                            .decode_need_more
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if !logged_need_more {
+                                            let pending_bytes =
+                                                pending_len_before.unwrap_or_else(|| pending.len());
+                                            tracing::debug!(
+                                                "[SBE] need_more shard={} pending_bytes={}",
+                                                ctx.shard_index,
+                                                pending_bytes
+                                            );
+                                            logged_need_more = true;
                                         }
+                                    }
                                         DecodeStatus::OutputTruncated => {
-                                            ctx.log_tx
-                                                .send(MetricEvent::DecodeTruncated.into())
-                                                .ok();
+                                            ctx.hot
+                                                .decode_truncated
+                                                .fetch_add(1, Ordering::Relaxed);
                                         }
                                         DecodeStatus::Corrupt => {
-                                            ctx.log_tx
-                                                .send(MetricEvent::DecodeCorrupt.into())
-                                                .ok();
+                                            ctx.hot
+                                                .decode_corrupt
+                                                .fetch_add(1, Ordering::Relaxed);
                                             pending.clear();
                                         }
                                         DecodeStatus::SchemaMismatch => {
-                                            ctx.log_tx
-                                                .send(MetricEvent::DecodeSchemaMismatch.into())
-                                                .ok();
+                                            ctx.hot
+                                                .decode_schema_mismatch
+                                                .fetch_add(1, Ordering::Relaxed);
                                             ctx.schema_guard.record_mismatch();
                                             pending.clear();
                                         }
@@ -543,7 +564,7 @@ async fn run_shard_stream(
                                     }
                                 }
                                 Ok(Message::Text(_)) => {
-                                    ctx.log_tx.send(MetricEvent::WsTextIn.into()).ok();
+                                    ctx.hot.ws_text_in.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Ok(Message::Ping(data)) => {
                                     if let Err(err) = send_rate_limited(&mut ws_sink, &mut rate_limiter, Message::Pong(data)).await {
@@ -720,8 +741,11 @@ fn process_trade(ctx: &ShardContext, trade: &BsbeTrade, last_seq: &mut HashMap<S
         return;
     };
 
-    ctx.log_tx.send(MetricEvent::PriceEventIn.into()).ok();
-    ctx.send_shadow_tick(&meta, trade);
+    let wall_ns = wall_clock_now_ns();
+    if wall_ns > 0 && wall_ns.saturating_sub(trade.event_ts_ns) > ctx.max_exch_skew_ns {
+        ctx.hot.drop_skew.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
 
     let seq = trade.trade_id;
     if seq > 0 {
@@ -768,10 +792,7 @@ fn process_trade(ctx: &ShardContext, trade: &BsbeTrade, last_seq: &mut HashMap<S
         }
     }
 
-    let wall_ns = wall_clock_now_ns();
-    if wall_ns > 0 && wall_ns.saturating_sub(trade.event_ts_ns) > ctx.max_skew_ns {
-        return;
-    }
+    ctx.send_shadow_tick(&meta, trade);
 
     let now = Instant::now();
     let event = PriceEvent {
@@ -783,6 +804,7 @@ fn process_trade(ctx: &ShardContext, trade: &BsbeTrade, last_seq: &mut HashMap<S
         event_ts_ms: normalize_ts_to_ms(trade.event_ts_ns),
         seq,
     };
+    ctx.hot.price_in.fetch_add(1, Ordering::Relaxed);
     ctx.emit_price_event(event);
 }
 

@@ -28,7 +28,9 @@ cargo run --release
 ```
 
 $env:BINANCE_SBE_API_KEY="H57xQl3d5pGXLUQmFvANn7hMmNBJqsUyX2PWszhdytwT0ods3UrZgq60awmaxqzP"
-$env:LOG_PROFILE="clean"
+$env:BINANCE_API_KEY    = "MzYrHl9UayAmgCYei9dvHoc1pHbXfqkldJ3vLMtrhaxbgBlGl5VB21fAE7cRLGnA"
+$env:BINANCE_API_SECRET = "nXugw3xOgEOic2tbehqGoVJb4z5uZG0tq3KL7jsO05Il4qUIEa69Xdsfq03IAbcq"
+$env:LOG_PROFILE="verbose"
 $env:EXECUTION_MODE="Live"
 $env:LIVE_ARMED="true"
 cargo run --release
