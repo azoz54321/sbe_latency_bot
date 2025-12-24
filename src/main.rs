@@ -2,8 +2,14 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use crossbeam_channel::bounded;
+use hex;
+use hmac::{Hmac, Mac};
 use num_traits::ToPrimitive;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
+use sha2::Sha256;
 use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
 use std::sync::{atomic::AtomicU64, Arc};
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
@@ -11,10 +17,10 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use tracing::info;
 
+use sbe_latency_bot::account_stream;
 use sbe_latency_bot::channels::spsc_channel;
 use sbe_latency_bot::clock::{Clock, SystemClock};
 use sbe_latency_bot::config::{Config, ExecutionMode, ServerId, ShardAssignment};
-use sbe_latency_bot::account_stream;
 use sbe_latency_bot::data_feed::{self, ShardHandle};
 use sbe_latency_bot::execution::{self, ExecGuards};
 use sbe_latency_bot::filters::FilterCache;
@@ -26,12 +32,14 @@ use sbe_latency_bot::processor;
 use sbe_latency_bot::reset;
 use sbe_latency_bot::rings::{Rings, RingsHandle};
 use sbe_latency_bot::strategy::shadow;
-use sbe_latency_bot::universe::{self, load_haram_list, SymbolKey, UniverseHandle};
 use sbe_latency_bot::time_sync::TimeSync;
+use sbe_latency_bot::universe::{self, load_haram_list, SymbolKey, UniverseHandle};
+use serde::Deserialize;
 
 const SHADOW_SHARD_SIZE: usize = 120;
 const HARAM_LIST_PATH: &str = "config/haram.list";
 const KSA_TZ: Tz = chrono_tz::Asia::Riyadh;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Copy, Clone, Debug)]
 enum RefreshEvent {
@@ -47,6 +55,32 @@ async fn main() -> anyhow::Result<()> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let time_sync = Arc::new(TimeSync::new(config.transport.rest_base_url)?);
     time_sync.clone().spawn_poll(Duration::from_secs(30));
+    time_sync
+        .resync_blocking()
+        .context("initial time sync failed")?;
+
+    let (slot_budget, usdt_free_start) = if config.execution.mode == ExecutionMode::Live {
+        let (free_usdt, locked_usdt) = fetch_usdt_balance(config, time_sync.clone())
+            .await
+            .context("[CAPITAL] failed_to_fetch_usdt_balance")?;
+        let usable = free_usdt;
+        let slot = floor_usdt_cents(usable / Decimal::from_i64(2).unwrap_or(Decimal::ONE));
+        tracing::info!(
+            "[CAPITAL] usdt_free={} usdt_locked={} usable={} slot_a={} slot_b={}",
+            free_usdt,
+            locked_usdt,
+            usable,
+            slot,
+            slot
+        );
+        (slot, free_usdt)
+    } else {
+        (
+            Decimal::from_f64(config.execution.order_quote_size_usdt)
+                .unwrap_or_else(|| Decimal::from_f64(50.0).unwrap_or(Decimal::ZERO)),
+            Decimal::ZERO,
+        )
+    };
 
     let initial_universe = match universe::build_universe(config, clock.as_ref()).await {
         Ok(universe) => {
@@ -167,8 +201,12 @@ async fn main() -> anyhow::Result<()> {
     let log_handle = logging::spawn_log_aggregator(config, log_rx, hot.clone());
     let _user_stream = UserStreamService::maybe_spawn(config, log_tx.clone());
     let (account_tx, account_rx) = crossbeam_channel::unbounded();
-    let _account_stream =
-        account_stream::spawn_account_stream(config, account_tx.clone(), log_tx.clone(), time_sync.clone());
+    let _account_stream = account_stream::spawn_account_stream(
+        config,
+        account_tx.clone(),
+        log_tx.clone(),
+        time_sync.clone(),
+    );
     let (reconnect_tx, reconnect_rx) = crossbeam_channel::unbounded();
 
     let mut shard_receivers = Vec::with_capacity(shard_plans.len());
@@ -206,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
         config,
         server_spec,
         clock.clone(),
+        slot_budget,
+        usdt_free_start,
         universe_handle.clone(),
         rings_handle.clone(),
         trading_gate.clone(),
@@ -272,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
         filter_cache.clone(),
         exec_guards.clone(),
         risk_handle.clone(),
+        slot_budget,
     );
 
     processor_handle
@@ -525,4 +566,71 @@ fn log_config_summary(config: &'static Config) {
         sbe_key_present,
         rest_key_present
     );
+}
+
+#[derive(Deserialize)]
+struct AccountBalance {
+    asset: String,
+    free: String,
+    locked: String,
+}
+
+#[derive(Deserialize)]
+struct AccountResponse {
+    #[serde(default)]
+    balances: Vec<AccountBalance>,
+}
+
+async fn fetch_usdt_balance(
+    config: &'static Config,
+    time_sync: Arc<TimeSync>,
+) -> anyhow::Result<(Decimal, Decimal)> {
+    if config.credentials.rest_api_key.is_empty() || config.credentials.rest_api_secret.is_empty() {
+        anyhow::bail!("REST credentials missing");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building account client")?;
+    let recv_window = config.execution.recv_window_ms.max(5_000);
+    let timestamp = time_sync.now_ms_synced();
+    let payload = format!("recvWindow={recv_window}&timestamp={timestamp}");
+    let signature = sign_payload(&payload, config.credentials.rest_api_secret)?;
+    let url = format!(
+        "{}/api/v3/account?{}&signature={}",
+        config.transport.rest_base_url, payload, signature
+    );
+    let resp = client
+        .get(&url)
+        .header("X-MBX-APIKEY", config.credentials.rest_api_key)
+        .send()
+        .await
+        .context("sending account request")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("status={status} body={body}");
+    }
+    let parsed: AccountResponse =
+        serde_json::from_str(&body).context("decoding account response")?;
+    let usdt = parsed
+        .balances
+        .into_iter()
+        .find(|bal| bal.asset.eq_ignore_ascii_case("USDT"))
+        .ok_or_else(|| anyhow::anyhow!("USDT balance missing"))?;
+    let free = Decimal::from_str(&usdt.free).context("parsing free USDT")?;
+    let locked = Decimal::from_str(&usdt.locked).context("parsing locked USDT")?;
+    Ok((free, locked))
+}
+
+fn sign_payload(payload: &str, secret: &str) -> anyhow::Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    mac.update(payload.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn floor_usdt_cents(value: Decimal) -> Decimal {
+    let hundred = Decimal::from_i32(100).unwrap_or(Decimal::ONE);
+    ((value * hundred).floor() / hundred).normalize()
 }

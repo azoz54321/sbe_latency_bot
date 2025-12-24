@@ -146,6 +146,7 @@ struct Stats {
     buy_err: u64,
     signal_suppressed: u64,
     suppressed_not_armed: u64,
+    ws_unknown_resp: u64,
     price_to_send_ms: VecDeque<f64>,
     trigger_to_send_ms: VecDeque<f64>,
     last_queue_drop_market: Option<Symbol>,
@@ -178,6 +179,7 @@ impl Stats {
         self.buy_err = 0;
         self.signal_suppressed = 0;
         self.suppressed_not_armed = 0;
+        self.ws_unknown_resp = 0;
         self.price_to_send_ms.clear();
         self.trigger_to_send_ms.clear();
         self.last_queue_drop_market = None;
@@ -264,6 +266,9 @@ impl Stats {
             MetricEvent::RiskDenyHaram { symbol } => {
                 self.deny_haram += 1;
                 self.last_deny_haram = Some(symbol);
+            }
+            MetricEvent::WsUnknownResponse => {
+                self.ws_unknown_resp += 1;
             }
         }
     }
@@ -371,6 +376,9 @@ impl Stats {
             if let Some(symbol) = self.last_deny_haram {
                 notes.push(format!("last_deny_haram={}", symbol));
             }
+        }
+        if self.ws_unknown_resp > 0 {
+            notes.push(format!("ws_unknown_resp={}", self.ws_unknown_resp));
         }
         if notes.is_empty() {
             String::new()

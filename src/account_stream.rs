@@ -56,17 +56,10 @@ pub fn spawn_account_stream(
                     .build()
                     .expect("account stream runtime");
                 runtime.block_on(async move {
-                    if let Err(err) =
-                        run_stream(
-                            config,
-                            &base_url,
-                            &api_key,
-                            &secret,
-                            account_tx,
-                            log_tx,
-                            time_sync,
-                        )
-                        .await
+                    if let Err(err) = run_stream(
+                        config, &base_url, &api_key, &secret, account_tx, log_tx, time_sync,
+                    )
+                    .await
                     {
                         let _ = log_tx_clone
                             .send(LogMessage::Error(format!("[ACCT] stream stopped: {err:?}")));
@@ -106,9 +99,7 @@ async fn run_stream(
         if let Ok(snapshot) =
             fetch_account_snapshot(&client, rest_base, api_key, api_secret, &time_sync).await
         {
-            let _ = account_tx.send(AccountEvent::AccountSnapshot {
-                balances: snapshot,
-            });
+            let _ = account_tx.send(AccountEvent::AccountSnapshot { balances: snapshot });
         }
 
         if let Ok(open_orders) =
@@ -178,7 +169,11 @@ async fn run_stream(
     }
 }
 
-async fn create_listen_key(client: &Client, base_url: &str, api_key: &str) -> anyhow::Result<String> {
+async fn create_listen_key(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+) -> anyhow::Result<String> {
     let url = format!("{}/api/v3/userDataStream", base_url);
     let response = client
         .post(&url)
@@ -231,7 +226,10 @@ async fn fetch_account_snapshot(
     let timestamp_ms = time_sync.now_ms_synced();
     let payload = format!("timestamp={timestamp_ms}");
     let signature = sign_payload(&payload, api_secret);
-    let url = format!("{}/api/v3/account?{}&signature={}", base_url, payload, signature);
+    let url = format!(
+        "{}/api/v3/account?{}&signature={}",
+        base_url, payload, signature
+    );
     let response = client
         .get(&url)
         .header("X-MBX-APIKEY", api_key)
@@ -241,12 +239,11 @@ async fn fetch_account_snapshot(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("account snapshot rejected status={status} body={body}"));
+        return Err(anyhow!(
+            "account snapshot rejected status={status} body={body}"
+        ));
     }
-    let payload: AccountSnapshot = response
-        .json()
-        .await
-        .context("decoding account snapshot")?;
+    let payload: AccountSnapshot = response.json().await.context("decoding account snapshot")?;
     Ok(payload
         .balances
         .into_iter()
@@ -283,10 +280,7 @@ async fn fetch_open_orders(
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("open orders rejected status={status} body={body}"));
     }
-    let payload: Vec<RestOpenOrder> = response
-        .json()
-        .await
-        .context("decoding open orders")?;
+    let payload: Vec<RestOpenOrder> = response.json().await.context("decoding open orders")?;
     let mut orders = Vec::with_capacity(payload.len());
     for order in payload {
         if let Some(symbol) = Symbol::from_str(&order.symbol) {
@@ -327,6 +321,8 @@ fn handle_ws_message(text: &str, account_tx: &Sender<AccountEvent>) -> anyhow::R
                     cum_qty: parse_decimal(&report.cum_qty),
                     last_qty: parse_decimal(&report.last_qty),
                     last_price: parse_decimal(&report.last_price),
+                    cum_quote: parse_decimal(report.cum_quote.as_deref().unwrap_or("0")),
+                    last_quote: parse_decimal(report.last_quote.as_deref().unwrap_or("0")),
                     commission_asset: report.commission_asset,
                     commission: report.commission.map(|c| parse_decimal(&c)),
                     reject_reason: report.reject_reason,
@@ -440,6 +436,10 @@ struct WsExecutionReport {
     last_qty: String,
     #[serde(rename = "L")]
     last_price: String,
+    #[serde(rename = "Z")]
+    cum_quote: Option<String>,
+    #[serde(rename = "Y")]
+    last_quote: Option<String>,
     #[serde(rename = "n")]
     commission: Option<String>,
     #[serde(rename = "N")]

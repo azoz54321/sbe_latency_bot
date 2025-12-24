@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::types::Symbol;
+use rust_decimal::Decimal;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SlotId {
@@ -40,10 +41,11 @@ struct SlotState {
     tp_client_id: Option<String>,
     order_id: Option<String>,
     pending_since: Option<Instant>,
+    budget: Decimal,
 }
 
 impl SlotState {
-    fn new() -> Self {
+    fn new(budget: Decimal) -> Self {
         Self {
             symbol: None,
             phase: SlotPhase::Idle,
@@ -51,6 +53,7 @@ impl SlotState {
             tp_client_id: None,
             order_id: None,
             pending_since: None,
+            budget,
         }
     }
 
@@ -80,9 +83,9 @@ pub struct CapitalSlots {
 
 #[allow(clippy::new_without_default)]
 impl CapitalSlots {
-    pub fn new() -> Self {
+    pub fn new(slot_a_budget: Decimal, slot_b_budget: Decimal) -> Self {
         Self {
-            slots: [SlotState::new(), SlotState::new()],
+            slots: [SlotState::new(slot_a_budget), SlotState::new(slot_b_budget)],
             client_lookup: HashMap::new(),
             pending_timeout: Duration::from_secs(5),
         }
@@ -256,6 +259,35 @@ impl CapitalSlots {
 
     pub fn slot_for_client(&self, client_order_id: &str) -> Option<(SlotId, OrderRole)> {
         self.client_lookup.get(client_order_id).copied()
+    }
+
+    pub fn slot_budget(&self, slot_id: SlotId) -> Decimal {
+        let idx = self.slot_index(slot_id).unwrap_or(0);
+        self.slots
+            .get(idx)
+            .map(|s| s.budget)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn set_budget(&mut self, slot_id: SlotId, budget: Decimal) {
+        if let Some(idx) = self.slot_index(slot_id) {
+            if let Some(slot) = self.slots.get_mut(idx) {
+                slot.budget = budget;
+            }
+        }
+    }
+
+    pub fn set_budgets(&mut self, slot_a_budget: Decimal, slot_b_budget: Decimal) {
+        if let Some(slot) = self.slots.get_mut(0) {
+            slot.budget = slot_a_budget;
+        }
+        if let Some(slot) = self.slots.get_mut(1) {
+            slot.budget = slot_b_budget;
+        }
+    }
+
+    pub fn both_idle(&self) -> bool {
+        self.slots.iter().all(|slot| slot.phase == SlotPhase::Idle)
     }
 
     pub fn reserved_only(&self) -> bool {

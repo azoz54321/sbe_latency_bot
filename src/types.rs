@@ -217,6 +217,7 @@ pub enum MetricEvent {
     RiskDenyHaram {
         symbol: Symbol,
     },
+    WsUnknownResponse,
 }
 
 impl From<MetricEvent> for LogMessage {
@@ -240,6 +241,8 @@ pub struct AccountExecutionReport {
     pub cum_qty: Decimal,
     pub last_qty: Decimal,
     pub last_price: Decimal,
+    pub cum_quote: Decimal,
+    pub last_quote: Decimal,
     pub commission_asset: Option<String>,
     pub commission: Option<Decimal>,
     pub reject_reason: Option<String>,
@@ -266,9 +269,16 @@ pub struct OpenOrderSnapshot {
 #[derive(Clone, Debug)]
 pub enum AccountEvent {
     Execution(AccountExecutionReport),
-    OutboundAccountPosition { balances: Vec<BalanceSnapshot> },
-    BalanceUpdate { asset: String, delta: Decimal },
-    AccountSnapshot { balances: Vec<BalanceSnapshot> },
+    OutboundAccountPosition {
+        balances: Vec<BalanceSnapshot>,
+    },
+    BalanceUpdate {
+        asset: String,
+        delta: Decimal,
+    },
+    AccountSnapshot {
+        balances: Vec<BalanceSnapshot>,
+    },
     OpenOrders(Vec<OpenOrderSnapshot>),
     LocalReject {
         client_order_id: String,

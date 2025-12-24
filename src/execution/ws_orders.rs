@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::fees::tp_target_px;
 use crate::net::backoff;
 use crate::time_sync::TimeSync;
-use crate::types::{LogMessage, Symbol};
+use crate::types::{LogMessage, MetricEvent, Symbol};
 
 use super::{
     format_decimal, ExecutionCommand, HmacSha256, OrderError, OrderIds, OrderSubmitError,
@@ -136,6 +136,7 @@ struct WsOrderRuntime {
     pair_seq: AtomicU64,
     recv_window: u64,
     command_tx: Sender<ExecutionCommand>,
+    unknown_responses: u64,
 }
 
 impl WsOrderRuntime {
@@ -159,6 +160,7 @@ impl WsOrderRuntime {
             pair_seq: AtomicU64::new(1),
             recv_window,
             command_tx,
+            unknown_responses: 0,
         }
     }
 
@@ -415,10 +417,17 @@ impl WsOrderRuntime {
             "newClientOrderId".to_string(),
             order.client_order_id.clone(),
         ));
-        params.push((
-            "quantity".to_string(),
-            format_decimal(order.quantity, order.quantity_scale),
-        ));
+        if let Some(quote_qty) = order.quote_quantity {
+            params.push((
+                "quoteOrderQty".to_string(),
+                format_decimal(quote_qty, order.quote_scale),
+            ));
+        } else {
+            params.push((
+                "quantity".to_string(),
+                format_decimal(order.quantity, order.quantity_scale),
+            ));
+        }
         params.push(("recvWindow".to_string(), self.recv_window.to_string()));
         params.push(("side".to_string(), order.side.to_string()));
         params.push(("symbol".to_string(), order.symbol.as_str().to_string()));
@@ -568,7 +577,12 @@ impl WsOrderRuntime {
         let key = match self.lookup.remove(&id) {
             Some(key) => key,
             None => {
-                self.log_error(format!("[WS] unknown response id={id}"));
+                self.unknown_responses = self.unknown_responses.saturating_add(1);
+                self.log_debug(format!(
+                    "[WS] unknown response id={} total_unknown={}",
+                    id, self.unknown_responses
+                ));
+                let _ = self.log_tx.send(MetricEvent::WsUnknownResponse.into());
                 return Ok(());
             }
         };
@@ -766,6 +780,8 @@ impl WsOrderRuntime {
             order_type: "LIMIT",
             quantity: plan.quantity,
             quantity_scale: plan.quantity_scale,
+            quote_quantity: None,
+            quote_scale: 0,
             price: Some(plan.new_price),
             price_scale: plan.price_scale,
             client_order_id: plan.new_client_id.clone(),
@@ -1145,8 +1161,16 @@ fn classify_ws_error(code: Option<i64>, msg: &str) -> OrderError {
     if upper.contains("MIN_NOTIONAL") {
         return OrderError::FilterMinNotional;
     }
+    if upper.contains("-1100") {
+        return OrderError::BadClientOrderId;
+    }
+    if upper.contains("-2010") || upper.contains("INSUFFICIENT_BALANCE") {
+        return OrderError::InsufficientBalance;
+    }
 
     match code.unwrap_or_default() {
+        -2010 => OrderError::InsufficientBalance,
+        -1100 => OrderError::BadClientOrderId,
         -1021 => OrderError::ClockSkew,
         -1013 | -1131 => OrderError::FilterLotStep,
         -1015 | -1003 => OrderError::Transient,

@@ -37,6 +37,8 @@ pub fn spawn_processor(
     config: &'static Config,
     server: &'static ServerSpec,
     clock: Arc<dyn Clock>,
+    slot_budget: Decimal,
+    usdt_free_start: Decimal,
     universe: UniverseHandle,
     rings: RingsHandle,
     trading_gate: Arc<TradingGate>,
@@ -66,6 +68,8 @@ pub fn spawn_processor(
                 let mut processor = Processor::new(
                     config,
                     clock,
+                    slot_budget,
+                    usdt_free_start,
                     shard_inputs,
                     trigger_tx,
                     log_tx,
@@ -195,7 +199,6 @@ struct Processor {
     risk: RiskEngine,
     execution: Option<ExecutionHandle>,
     benchmarks: Benchmarks,
-    target_notional: Decimal,
     last_snapshot: Instant,
     next_ahi_compute: Instant,
     #[allow(dead_code)]
@@ -212,6 +215,8 @@ struct Processor {
     diag_next_log: Instant,
     balances: HashMap<String, BalanceSnapshot>,
     client_ids: ClientOrderIdGen,
+    usdt_free: Decimal,
+    usdt_free_fallback: Decimal,
 }
 struct ShardChannel {
     receiver: SpscReceiver<PriceEvent>,
@@ -223,11 +228,10 @@ struct ClientOrderIdGen {
 }
 
 impl ClientOrderIdGen {
-    fn next(&mut self, slot: SlotId, symbol: Symbol, clock: &dyn Clock) -> (String, String) {
+    fn next(&mut self, slot: SlotId) -> (String, String) {
         self.seq = self.seq.wrapping_add(1);
-        let ts_ms = clock.unix_now_ns() / 1_000_000;
-        let base = format!("SBELAT-{}-{}-{ts_ms}-{}", slot.label(), symbol, self.seq);
-        (base.clone(), format!("{base}-TP"))
+        let base = format!("SB-{}-{:08}", slot.label(), self.seq);
+        (base.clone(), format!("{base}T"))
     }
 }
 
@@ -236,6 +240,8 @@ impl Processor {
     fn new(
         config: &'static Config,
         clock: Arc<dyn Clock>,
+        slot_budget: Decimal,
+        usdt_free_start: Decimal,
         shard_inputs: Vec<(ShardAssignment, SpscReceiver<PriceEvent>)>,
         trigger_tx: SpscSender<TriggerEvent>,
         log_tx: Sender<LogMessage>,
@@ -285,11 +291,9 @@ impl Processor {
         if armed_live {
             info!(target: "bot", "ModeNotLive gate override active (Live+Armed)");
         }
-        let capital = CapitalSlots::new();
+        let capital = CapitalSlots::new(slot_budget, slot_budget);
         let positions = PositionBook::new();
 
-        let target_notional = Decimal::from_f64(config.execution.order_quote_size_usdt)
-            .unwrap_or_else(|| Decimal::from_f64(50.0).unwrap());
         let mut haram_symbols = HashSet::new();
         for entry in &config.strategy.haram_symbols {
             if let Some(symbol) = Symbol::from_str(entry) {
@@ -317,7 +321,6 @@ impl Processor {
             risk,
             execution: None,
             benchmarks: Benchmarks::new(),
-            target_notional,
             last_snapshot: now,
             next_ahi_compute,
             universe,
@@ -332,6 +335,8 @@ impl Processor {
             diag_next_log: now,
             balances: HashMap::new(),
             client_ids: ClientOrderIdGen::default(),
+            usdt_free: usdt_free_start,
+            usdt_free_fallback: usdt_free_start,
         }
     }
 
@@ -395,6 +400,7 @@ impl Processor {
                 .into(),
             ));
         }
+        self.rebalance_slots_if_free();
     }
 
     fn handle_reconnect(&mut self, notice: ReconnectNotice) {
@@ -450,9 +456,7 @@ impl Processor {
             AccountEvent::BalanceUpdate { asset, delta } => {
                 self.handle_balance_update(asset, delta)
             }
-            AccountEvent::AccountSnapshot { balances } => {
-                self.handle_balance_snapshot(balances)
-            }
+            AccountEvent::AccountSnapshot { balances } => self.handle_balance_snapshot(balances),
             AccountEvent::OpenOrders(orders) => self.handle_open_orders(orders),
             AccountEvent::LocalReject {
                 client_order_id,
@@ -460,16 +464,23 @@ impl Processor {
                 reason,
             } => {
                 let _ = self.log_tx.send(LogMessage::Warn(
-                    format!("[ACCT] local_reject cid={} symbol={} reason={}", client_order_id, symbol, reason).into(),
+                    format!(
+                        "[ACCT] local_reject cid={} symbol={} reason={}",
+                        client_order_id, symbol, reason
+                    )
+                    .into(),
                 ));
                 let _ = self.capital.release_by_client(&client_order_id);
                 self.positions.close(symbol);
+                self.rebalance_slots_if_free();
             }
             AccountEvent::StreamClosed => {}
         }
     }
 
     fn reset_daily_components(&mut self) {
+        let usdt_available = self.current_usdt_free();
+        let portfolio_value = self.portfolio_value_usd();
         self.capital.reset_daily();
         self.risk.reset_daily_counters_keep_long_bans();
         self.positions.reset_daily_view();
@@ -480,6 +491,11 @@ impl Processor {
         self.diag_next_log = self.clock.now_instant();
         self.balances.clear();
         self.client_ids = ClientOrderIdGen::default();
+        let spent = self.maybe_top_up_bnb(portfolio_value, usdt_available);
+        let remaining_usdt = (usdt_available - spent).max(Decimal::ZERO);
+        self.usdt_free = remaining_usdt;
+        self.usdt_free_fallback = remaining_usdt;
+        self.rebalance_slots_with_total(remaining_usdt);
         let _ = self.log_tx.send(LogMessage::ResetDaily);
     }
 
@@ -498,21 +514,26 @@ impl Processor {
                 .clone()
                 .unwrap_or_else(|| report.client_order_id.clone())
         };
-        let role_lookup = self
-            .capital
-            .slot_for_client(&client_id);
+        let role_lookup = self.capital.slot_for_client(&client_id);
 
         let Some((slot, role)) = role_lookup else {
             return;
         };
 
         if status_upper == "NEW" {
-            let _ = self
-                .capital
-                .mark_reserved(&client_id, report.order_id.clone(), self.clock.now_instant());
+            let _ = self.capital.mark_reserved(
+                &client_id,
+                report.order_id.clone(),
+                self.clock.now_instant(),
+            );
             if let OrderRole::Buy = role {
                 if let Some(execution) = self.execution.as_ref() {
                     execution.notify_buy_confirmed(client_id.clone());
+                }
+            }
+            if let OrderRole::TakeProfit = role {
+                if let Some(execution) = self.execution.as_ref() {
+                    execution.notify_tp_confirmed(client_id.clone());
                 }
             }
             return;
@@ -525,11 +546,17 @@ impl Processor {
             match role {
                 OrderRole::Buy => {
                     self.ensure_position_open(slot, &report);
+                    if status_upper == "FILLED" {
+                        self.place_tp_after_fill(slot, &report);
+                    }
                     if let Some(execution) = self.execution.as_ref() {
                         execution.notify_buy_confirmed(client_id.clone());
                     }
                 }
                 OrderRole::TakeProfit => {
+                    if let Some(execution) = self.execution.as_ref() {
+                        execution.notify_tp_confirmed(client_id.clone());
+                    }
                     if status_upper == "FILLED" {
                         self.close_position_from_tp(&report);
                     }
@@ -542,6 +569,7 @@ impl Processor {
             if let Some((_, symbol)) = self.capital.release_by_client(&client_id) {
                 self.positions.close(symbol);
             }
+            self.rebalance_slots_if_free();
             return;
         }
     }
@@ -576,11 +604,8 @@ impl Processor {
             strategy.maker_fee_pct,
             strategy.taker_fee_pct,
         );
-        let bounce_break_even = breakeven_px(
-            entry_price,
-            strategy.maker_fee_pct,
-            strategy.taker_fee_pct,
-        );
+        let bounce_break_even =
+            breakeven_px(entry_price, strategy.maker_fee_pct, strategy.taker_fee_pct);
         let tp_order_id = self.capital.tp_client_id(slot);
         let now = self.clock.now_instant();
         let already_open = self.positions.contains(report.symbol);
@@ -599,6 +624,118 @@ impl Processor {
         if !already_open {
             let now_ksa = self.config.ksa_now(self.clock.as_ref());
             self.risk.mark_trade_open(report.symbol, now_ksa);
+        }
+    }
+
+    fn place_tp_after_fill(&mut self, slot: SlotId, report: &AccountExecutionReport) {
+        let executed_qty = if report.cum_qty > Decimal::ZERO {
+            report.cum_qty
+        } else {
+            report.last_qty
+        };
+        if executed_qty <= Decimal::ZERO {
+            return;
+        }
+        let avg_price = if report.cum_quote > Decimal::ZERO && report.cum_qty > Decimal::ZERO {
+            (report.cum_quote / report.cum_qty).normalize()
+        } else if report.last_price > Decimal::ZERO {
+            report.last_price
+        } else {
+            report.price
+        };
+        if avg_price <= Decimal::ZERO {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] skip placement avg_price_missing symbol={} cid={}",
+                    report.symbol, report.client_order_id
+                )
+                .into(),
+            ));
+            return;
+        }
+        let Some(execution) = self.execution.as_ref() else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] skip placement execution handle missing symbol={} cid={}",
+                    report.symbol, report.client_order_id
+                )
+                .into(),
+            ));
+            return;
+        };
+        let Some(filters) = execution.filters_for(report.symbol) else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] skip placement filters missing symbol={} cid={}",
+                    report.symbol, report.client_order_id
+                )
+                .into(),
+            ));
+            return;
+        };
+        let tp_client_id = match self.capital.tp_client_id(slot) {
+            Some(id) => id,
+            None => {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[TP] skip placement tp_client_id missing slot={}",
+                        slot.label()
+                    )
+                    .into(),
+                ));
+                return;
+            }
+        };
+        let qty_aligned = floor_to_step(executed_qty, filters.step);
+        if qty_aligned <= Decimal::ZERO {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] skip placement qty_zero symbol={} qty={}",
+                    report.symbol, executed_qty
+                )
+                .into(),
+            ));
+            return;
+        }
+        let tp_price = align_tick_up(
+            avg_price * (Decimal::ONE + self.config.strategy.tp_pct),
+            filters.tick,
+        );
+        if tp_price <= Decimal::ZERO {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP] skip placement price_zero symbol={} avg_price={}",
+                    report.symbol, avg_price
+                )
+                .into(),
+            ));
+            return;
+        }
+        match execution.place_tp_limit(
+            report.symbol,
+            executed_qty,
+            avg_price,
+            tp_client_id.clone(),
+            report.client_order_id.clone(),
+        ) {
+            Ok(_) => {
+                if let Some(position) = self.positions.get_mut(report.symbol) {
+                    position.take_profit = tp_price;
+                    position.tp_order_id = Some(tp_client_id.clone());
+                    position.tp_order_qty = qty_aligned;
+                    position.tp_current_price = tp_price;
+                    position.tp_initial_price = tp_price;
+                }
+            }
+            Err(err) => {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[TP] place_failed symbol={} cid={} err={}",
+                        report.symbol, tp_client_id, err
+                    )
+                    .into(),
+                ));
+            }
         }
     }
 
@@ -629,33 +766,164 @@ impl Processor {
             }
             self.balances.insert(bal.asset.clone(), bal);
         }
+        if let Some(usdt) = self.balances.get("USDT") {
+            self.usdt_free = usdt.free;
+        }
+        self.usdt_free_fallback = self.usdt_free;
+        self.rebalance_slots_if_free();
+    }
+
+    fn current_usdt_free(&self) -> Decimal {
+        if self.usdt_free > Decimal::ZERO {
+            self.usdt_free
+        } else {
+            self.usdt_free_fallback
+        }
+    }
+
+    fn portfolio_value_usd(&self) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for bal in self.balances.values() {
+            let amount = (bal.free + bal.locked).normalize();
+            if amount <= Decimal::ZERO {
+                continue;
+            }
+            if bal.asset.eq_ignore_ascii_case("USDT") {
+                total += amount;
+                continue;
+            }
+            let symbol_name = format!("{}USDT", bal.asset.to_ascii_uppercase());
+            if let Some(symbol) = Symbol::from_str(&symbol_name) {
+                if let Some(px_f64) = self.last_prices.get(&symbol) {
+                    if let Some(px) = Decimal::from_f64(*px_f64) {
+                        total += (amount * px).normalize();
+                    }
+                }
+            }
+        }
+        if total <= Decimal::ZERO {
+            self.current_usdt_free()
+        } else {
+            total
+        }
+    }
+
+    fn rebalance_slots_with_total(&mut self, total_usdt: Decimal) {
+        if total_usdt <= Decimal::ZERO {
+            return;
+        }
+        let half = floor_usdt_cents(total_usdt / Decimal::from_i64(2).unwrap_or(Decimal::ONE));
+        let current_a = self.capital.slot_budget(SlotId::A);
+        let current_b = self.capital.slot_budget(SlotId::B);
+        if current_a == half && current_b == half {
+            return;
+        }
+        self.capital.set_budgets(half, half);
+        if let Some(execution) = self.execution.as_ref() {
+            execution.update_target_notional(half);
+        }
+        let _ = self.log_tx.send(LogMessage::Info(
+            format!(
+                "[CAPITAL] rebalance slot_a={} slot_b={} total_usdt={}",
+                half, half, total_usdt
+            )
+            .into(),
+        ));
+    }
+
+    fn rebalance_slots_if_free(&mut self) {
+        if self.capital.both_idle() {
+            let total_usdt = self.current_usdt_free();
+            self.rebalance_slots_with_total(total_usdt);
+        }
+    }
+
+    fn maybe_top_up_bnb(&mut self, portfolio_value: Decimal, usdt_free: Decimal) -> Decimal {
+        let Some(execution) = self.execution.as_ref() else {
+            return Decimal::ZERO;
+        };
+        let Some(bnb_symbol) = Symbol::from_str("BNBUSDT") else {
+            return Decimal::ZERO;
+        };
+        if portfolio_value <= Decimal::ZERO || usdt_free <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let desired =
+            (portfolio_value * Decimal::from_f64(0.01).unwrap_or(Decimal::ZERO)).normalize();
+        let spend = floor_usdt_cents(desired.min(usdt_free));
+        let min_spend = Decimal::from_f64(5.0).unwrap_or(Decimal::ZERO);
+        if spend < min_spend {
+            let _ = self
+                .log_tx
+                .send(LogMessage::Info("[FEE] skip: insufficient USDT".into()));
+            return Decimal::ZERO;
+        }
+        let client_id = format!("FEE-{}", self.clock.monotonic_now_ns());
+        match execution.place_quote_market(bnb_symbol, spend, client_id.clone()) {
+            Ok(order_id) => {
+                let _ = self.log_tx.send(LogMessage::Info(
+                    format!(
+                        "[FEE] topup market_buy symbol={} spend_usdt={} cid={} oid={}",
+                        bnb_symbol, spend, client_id, order_id
+                    )
+                    .into(),
+                ));
+                spend
+            }
+            Err(err) => {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[FEE] topup_failed symbol={} spend_usdt={} cid={} err={}",
+                        bnb_symbol, spend, client_id, err
+                    )
+                    .into(),
+                ));
+                Decimal::ZERO
+            }
+        }
     }
 
     fn handle_balance_update(&mut self, asset: String, delta: Decimal) {
-        let entry = self.balances.entry(asset.clone()).or_insert(BalanceSnapshot {
-            asset: asset.clone(),
-            free: Decimal::ZERO,
-            locked: Decimal::ZERO,
-        });
+        let entry = self
+            .balances
+            .entry(asset.clone())
+            .or_insert(BalanceSnapshot {
+                asset: asset.clone(),
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            });
         entry.free += delta;
         let snapshot = entry.clone();
         self.log_balance_change(&asset, &snapshot, Some((delta, Decimal::ZERO)));
+        if asset.eq_ignore_ascii_case("USDT") {
+            self.usdt_free = snapshot.free;
+        }
+        self.usdt_free_fallback = self.usdt_free;
+        self.rebalance_slots_if_free();
     }
 
     fn handle_balance_snapshot(&mut self, balances: Vec<BalanceSnapshot>) {
         let initial = self.balances.is_empty();
         for bal in balances {
-            let delta = self.balances.get(&bal.asset).map(|prev| {
-                (
-                    bal.free - prev.free,
-                    bal.locked - prev.locked,
-                )
-            });
-            if initial || delta.as_ref().map(|(df, dl)| *df != Decimal::ZERO || *dl != Decimal::ZERO).unwrap_or(true) {
+            let delta = self
+                .balances
+                .get(&bal.asset)
+                .map(|prev| (bal.free - prev.free, bal.locked - prev.locked));
+            if initial
+                || delta
+                    .as_ref()
+                    .map(|(df, dl)| *df != Decimal::ZERO || *dl != Decimal::ZERO)
+                    .unwrap_or(true)
+            {
                 self.log_balance_change(&bal.asset, &bal, delta);
             }
             self.balances.insert(bal.asset.clone(), bal);
         }
+        if let Some(usdt) = self.balances.get("USDT") {
+            self.usdt_free = usdt.free;
+        }
+        self.usdt_free_fallback = self.usdt_free;
+        self.rebalance_slots_if_free();
     }
 
     fn handle_open_orders(&mut self, orders: Vec<crate::types::OpenOrderSnapshot>) {
@@ -664,7 +932,7 @@ impl Processor {
         }
         let managed: Vec<_> = orders
             .iter()
-            .filter(|o| o.client_order_id.starts_with("SBELAT-"))
+            .filter(|o| o.client_order_id.starts_with("SB-"))
             .collect();
         let external = orders.len().saturating_sub(managed.len());
         let _ = self.log_tx.send(LogMessage::Info(
@@ -920,8 +1188,22 @@ impl Processor {
             return;
         };
 
-        let (buy_client_order_id, tp_client_order_id) =
-            self.client_ids.next(slot, event.symbol, self.clock.as_ref());
+        let slot_budget = self.capital.slot_budget(slot);
+        let available_usdt = self.current_usdt_free();
+        if available_usdt < slot_budget {
+            let _ = self.log_tx.send(
+                MetricEvent::SignalSuppressed {
+                    symbol: event.symbol,
+                    reason: SignalSuppressReason::NoCapital,
+                }
+                .into(),
+            );
+            let _ = self.capital.release_slot(slot);
+            self.rebalance_slots_if_free();
+            return;
+        }
+
+        let (buy_client_order_id, tp_client_order_id) = self.client_ids.next(slot);
         if !self.capital.begin_pending_on_slot(
             now,
             slot,
@@ -932,13 +1214,26 @@ impl Processor {
             return;
         }
 
+        let slot_budget = self.capital.slot_budget(slot);
+        if slot_budget <= Decimal::ZERO {
+            let _ = self.log_tx.send(
+                MetricEvent::SignalSuppressed {
+                    symbol: event.symbol,
+                    reason: SignalSuppressReason::NoCapital,
+                }
+                .into(),
+            );
+            let _ = self.capital.release_slot(slot);
+            return;
+        }
+
         let trigger = TriggerEvent {
             symbol: event.symbol,
             price_now: event.price,
             ret_from_open,
             price_rx_instant: event.received_instant,
             trigger_instant,
-            target_notional: self.target_notional,
+            target_notional: slot_budget,
             trigger_ts_mono_ns: self.clock.instant_to_ns(trigger_instant),
             signal_ts_mono_ns: event.ts_mono_ns,
             slot,
@@ -1037,6 +1332,7 @@ impl Processor {
 
     fn finalize_exit(&mut self, position: Position, exit_price: Decimal, reason: ExitReason) {
         let _ = self.capital.release_slot(position.slot);
+        self.rebalance_slots_if_free();
 
         let strat = &self.config.strategy;
         let qty = position.qty;
@@ -1425,4 +1721,25 @@ impl EthBtcRatio {
     fn ret_1h(&self) -> Option<f64> {
         return_over(&self.ring_1h, Duration::from_secs(60 * 60))
     }
+}
+
+fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
+    if step <= Decimal::ZERO {
+        return qty;
+    }
+    let steps = (qty / step).floor();
+    (steps * step).normalize()
+}
+
+fn align_tick_up(price: Decimal, tick: Decimal) -> Decimal {
+    if tick <= Decimal::ZERO {
+        return price;
+    }
+    let steps = (price / tick).ceil();
+    (steps * tick).normalize()
+}
+
+fn floor_usdt_cents(value: Decimal) -> Decimal {
+    let hundred = Decimal::from_i32(100).unwrap_or(Decimal::ONE);
+    ((value * hundred).floor() / hundred).normalize()
 }
