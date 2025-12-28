@@ -16,10 +16,13 @@ use crate::capital::{CapitalSlots, OrderRole, SlotId};
 use crate::channels::{SpscReceiver, SpscSender};
 use crate::clock::Clock;
 use crate::config::{Config, ExecutionMode, LogProfile, ServerSpec, ShardAssignment};
-use crate::execution::{ExecutionHandle, OrderStatus, TargetInfo};
+use crate::execution::{
+    ExecutionHandle, OrderFill, OrderStatus, OrderSubmitError, ProviderError, TargetInfo,
+};
 use crate::fees::{breakeven_px, sl_trigger_px, tp_target_px};
 use crate::gates::{TradingGate, WarmupGate};
 use crate::mode::{Mode, ModeMachine};
+use crate::pending_tp::{PendingTpClearReason, PendingTpGate, PendingTpOps, PendingTpOutcome};
 use crate::positions::{ExitDecision, ExitReason, Position, PositionBook};
 use crate::rings::{abs_return_over, return_over, RingBuffer, RingsHandle, SymbolRings};
 use crate::risk::{RiskEngine, RiskHandle, TradeBlock};
@@ -31,6 +34,7 @@ use crate::universe::{Universe, UniverseHandle};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const RECONNECT_WARMUP_SECS: u64 = 60;
+const PENDING_TP_TIMEOUT_SECS: u64 = 5;
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_processor(
@@ -218,6 +222,7 @@ struct Processor {
     usdt_free: Decimal,
     usdt_free_fallback: Decimal,
     pending_recovery: HashMap<SlotId, PendingRecovery>,
+    pending_tp: PendingTpGate,
 }
 struct ShardChannel {
     receiver: SpscReceiver<PriceEvent>,
@@ -240,6 +245,64 @@ impl ClientOrderIdGen {
 struct PendingRecovery {
     attempts: u32,
     next_retry: Instant,
+}
+
+struct PendingTpRuntime<'a> {
+    processor: &'a mut Processor,
+}
+
+impl PendingTpOps for PendingTpRuntime<'_> {
+    fn tp_exists(&mut self, symbol: Symbol, tp_client_id: &str) -> Result<bool, ProviderError> {
+        let Some(execution) = self.processor.execution.as_ref() else {
+            return Err(ProviderError::fatal("execution handle missing"));
+        };
+        execution.find_open_order(symbol, tp_client_id.to_string())
+    }
+
+    fn position_qty(&mut self, symbol: Symbol) -> Option<Decimal> {
+        self.processor.positions.get(symbol).map(|pos| pos.qty)
+    }
+
+    fn query_order(&mut self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError> {
+        let Some(execution) = self.processor.execution.as_ref() else {
+            return Err(ProviderError::fatal("execution handle missing"));
+        };
+        execution.query_order(symbol, order_id.to_string())
+    }
+
+    fn query_balance(&mut self, asset: &str) -> Result<Decimal, ProviderError> {
+        let Some(execution) = self.processor.execution.as_ref() else {
+            return Err(ProviderError::fatal("execution handle missing"));
+        };
+        execution.query_balance(asset.to_string())
+    }
+
+    fn filters_for(&mut self, symbol: Symbol) -> Option<crate::filters::SymbolFilters> {
+        let execution = self.processor.execution.as_ref()?;
+        execution.filters_for(symbol)
+    }
+
+    fn last_price(&mut self, symbol: Symbol) -> Option<Decimal> {
+        self.processor
+            .last_prices
+            .get(&symbol)
+            .and_then(|px| Decimal::from_f64(*px))
+    }
+
+    fn place_market_sell(
+        &mut self,
+        symbol: Symbol,
+        qty: Decimal,
+        client_order_id: String,
+    ) -> Result<String, OrderSubmitError> {
+        let Some(execution) = self.processor.execution.as_ref() else {
+            return Err(OrderSubmitError {
+                kind: crate::execution::OrderError::Fatal,
+                detail: "execution handle missing".to_string(),
+            });
+        };
+        execution.place_market_sell(symbol, qty, client_order_id)
+    }
 }
 
 impl Processor {
@@ -345,6 +408,7 @@ impl Processor {
             usdt_free: usdt_free_start,
             usdt_free_fallback: usdt_free_start,
             pending_recovery: HashMap::new(),
+            pending_tp: PendingTpGate::new(Duration::from_secs(PENDING_TP_TIMEOUT_SECS)),
         }
     }
 
@@ -354,6 +418,7 @@ impl Processor {
             self.drain_reconnects();
             self.drain_account_events();
             self.handle_pending_timeouts();
+            self.handle_pending_tp_timeout();
 
             let mut made_progress = false;
             for idx in 0..self.shards.len() {
@@ -583,6 +648,89 @@ impl Processor {
         self.rebalance_slots_if_free();
     }
 
+    fn handle_pending_tp_timeout(&mut self) {
+        if !self.pending_tp.is_active() {
+            return;
+        }
+        let now = self.clock.now_instant();
+        let state_snapshot = self.pending_tp.state().cloned();
+        let Some(state) = state_snapshot else {
+            return;
+        };
+        let order_lookup_id = self
+            .capital
+            .order_id(state.slot)
+            .unwrap_or_else(|| state.buy_client_id.clone());
+        let base_asset = self
+            .universe
+            .get()
+            .symbol_meta(state.symbol)
+            .map(|meta| meta.base.clone());
+        let emergency_client_id = format!(
+            "EMERGENCY-{}-{}",
+            state.symbol,
+            self.clock.monotonic_now_ns()
+        );
+
+        let timeout = self.pending_tp.timeout();
+        let mut gate = std::mem::replace(&mut self.pending_tp, PendingTpGate::new(timeout));
+        let mut ops = PendingTpRuntime { processor: self };
+        let outcome = gate.handle_timeout(
+            now,
+            order_lookup_id,
+            base_asset,
+            emergency_client_id,
+            &mut ops,
+        );
+        self.pending_tp = gate;
+
+        match outcome {
+            PendingTpOutcome::NoAction => {}
+            PendingTpOutcome::Cleared { reason } => match reason {
+                PendingTpClearReason::OpenOrders => {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[GATE] pending_tp cleared proof=open_orders symbol={} cid={} tp_cid={}",
+                            state.symbol, state.buy_client_id, state.tp_client_id
+                        )
+                        .into(),
+                    ));
+                }
+            },
+            PendingTpOutcome::Kill { event } => {
+                let emergency_label = if event.emergency_ok { "ok" } else { "err" };
+                if event.emergency_attempted {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[EMERGENCY] market_sell {} symbol={} qty={} cid={}",
+                            emergency_label, event.symbol, event.qty, event.emergency_client_id
+                        )
+                        .into(),
+                    ));
+                } else {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[EMERGENCY] market_sell skipped symbol={} qty={} cid={}",
+                            event.symbol, event.qty, event.emergency_client_id
+                        )
+                        .into(),
+                    ));
+                }
+                let last_err = event.last_err.unwrap_or_else(|| "none".to_string());
+                let _ = self.log_tx.send(LogMessage::Error(format!(
+                    "[KILL] TP not placed within timeout; emergency_sell={} symbol={} cid={} qty={} elapsed_ms={} last_err={}",
+                    emergency_label,
+                    event.symbol,
+                    event.buy_client_id,
+                    event.qty,
+                    event.elapsed_ms,
+                    last_err
+                )));
+                std::process::exit(2);
+            }
+        }
+    }
+
     fn pending_recovery_ready(&self, slot: SlotId, now: Instant) -> bool {
         match self.pending_recovery.get(&slot) {
             Some(state) => now >= state.next_retry,
@@ -661,6 +809,13 @@ impl Processor {
             }
             AccountEvent::AccountSnapshot { balances } => self.handle_balance_snapshot(balances),
             AccountEvent::OpenOrders(orders) => self.handle_open_orders(orders),
+            AccountEvent::BuySubmitted {
+                symbol,
+                buy_client_order_id,
+                tp_client_order_id,
+            } => {
+                self.handle_buy_submitted(symbol, buy_client_order_id, tp_client_order_id);
+            }
             AccountEvent::LocalReject {
                 client_order_id,
                 symbol,
@@ -694,6 +849,7 @@ impl Processor {
         self.diag_next_log = self.clock.now_instant();
         self.balances.clear();
         self.client_ids = ClientOrderIdGen::default();
+        let _ = self.pending_tp.clear();
         let spent = self.maybe_top_up_bnb(portfolio_value, usdt_available);
         let remaining_usdt = (usdt_available - spent).max(Decimal::ZERO);
         self.usdt_free = remaining_usdt;
@@ -816,7 +972,10 @@ impl Processor {
         );
         let bounce_break_even =
             breakeven_px(entry_price, strategy.maker_fee_pct, strategy.taker_fee_pct);
-        let tp_order_id = self.capital.tp_client_id(slot);
+        let tp_order_id = self
+            .positions
+            .get(symbol)
+            .and_then(|position| position.tp_order_id.clone());
         let now = self.clock.now_instant();
         let already_open = self.positions.contains(symbol);
         self.positions.open(
@@ -883,38 +1042,6 @@ impl Processor {
             ));
             return;
         }
-        if let Some(position) = self.positions.get(symbol) {
-            if position.tp_order_id.is_some() && position.tp_order_qty > Decimal::ZERO {
-                let _ = self.log_tx.send(LogMessage::Info(
-                    format!(
-                        "[TP]{context} skip placement tp_exists symbol={} cid={}",
-                        symbol, buy_client_order_id
-                    )
-                    .into(),
-                ));
-                return;
-            }
-        }
-        let Some(execution) = self.execution.as_ref() else {
-            let _ = self.log_tx.send(LogMessage::Warn(
-                format!(
-                    "[TP]{context} skip placement execution handle missing symbol={} cid={}",
-                    symbol, buy_client_order_id
-                )
-                .into(),
-            ));
-            return;
-        };
-        let Some(filters) = execution.filters_for(symbol) else {
-            let _ = self.log_tx.send(LogMessage::Warn(
-                format!(
-                    "[TP]{context} skip placement filters missing symbol={} cid={}",
-                    symbol, buy_client_order_id
-                )
-                .into(),
-            ));
-            return;
-        };
         let tp_client_id = match self.capital.tp_client_id(slot) {
             Some(id) => id,
             None => {
@@ -927,6 +1054,82 @@ impl Processor {
                 ));
                 return;
             }
+        };
+        if let Some(position) = self.positions.get(symbol) {
+            if let Some(tp_order_id) = position.tp_order_id.as_ref() {
+                if position.tp_order_qty > Decimal::ZERO {
+                    let _ = self.log_tx.send(LogMessage::Info(
+                        format!(
+                            "[TP]{context} skip placement proof=tp_order_id symbol={} cid={} tp_cid={} tp_order_id={}",
+                            symbol, buy_client_order_id, tp_client_id, tp_order_id
+                        )
+                        .into(),
+                    ));
+                    if self.pending_tp.clear_if_tp(&tp_client_id) {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[GATE] pending_tp cleared proof=tp_order_id symbol={} cid={} tp_cid={} tp_order_id={}",
+                                symbol, buy_client_order_id, tp_client_id, tp_order_id
+                            )
+                            .into(),
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(execution) = self.execution.as_ref() else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP]{context} skip placement execution handle missing symbol={} cid={}",
+                    symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+            return;
+        };
+        if self.pending_tp.is_active() {
+            match execution.find_open_order(symbol, tp_client_id.clone()) {
+                Ok(true) => {
+                    let _ = self.log_tx.send(LogMessage::Info(
+                        format!(
+                            "[TP]{context} skip placement proof=open_orders symbol={} cid={} tp_cid={}",
+                            symbol, buy_client_order_id, tp_client_id
+                        )
+                        .into(),
+                    ));
+                    if self.pending_tp.clear_if_tp(&tp_client_id) {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[GATE] pending_tp cleared proof=open_orders symbol={} cid={} tp_cid={}",
+                                symbol, buy_client_order_id, tp_client_id
+                            )
+                            .into(),
+                        ));
+                    }
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[TP]{context} tp_exists check failed symbol={} cid={} err={:?}",
+                            symbol, buy_client_order_id, err
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
+        let Some(filters) = execution.filters_for(symbol) else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[TP]{context} skip placement filters missing symbol={} cid={}",
+                    symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+            return;
         };
         let qty_aligned = floor_to_step(executed_qty, filters.step);
         if qty_aligned <= Decimal::ZERO {
@@ -960,13 +1163,22 @@ impl Processor {
             tp_client_id.clone(),
             buy_client_order_id.clone(),
         ) {
-            Ok(_) => {
+            Ok(order_id) => {
                 if let Some(position) = self.positions.get_mut(symbol) {
                     position.take_profit = tp_price;
-                    position.tp_order_id = Some(tp_client_id.clone());
+                    position.tp_order_id = Some(order_id.clone());
                     position.tp_order_qty = qty_aligned;
                     position.tp_current_price = tp_price;
                     position.tp_initial_price = tp_price;
+                }
+                if self.pending_tp.clear_if_tp(&tp_client_id) {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[GATE] pending_tp cleared proof=tp_order_id symbol={} cid={} tp_cid={} tp_order_id={}",
+                            symbol, buy_client_order_id, tp_client_id, order_id
+                        )
+                        .into(),
+                    ));
                 }
                 if !source.is_empty() {
                     let _ = self.log_tx.send(LogMessage::Warn(
@@ -1195,6 +1407,74 @@ impl Processor {
             )
             .into(),
         ));
+        if let Some(state) = self.pending_tp.state() {
+            let tp_client_id = state.tp_client_id.clone();
+            let symbol = state.symbol;
+            let buy_client_id = state.buy_client_id.clone();
+            if orders.iter().any(|order| {
+                order.client_order_id == tp_client_id
+                    && order.symbol == symbol
+                    && order.side.eq_ignore_ascii_case("SELL")
+            }) {
+                if self.pending_tp.clear_if_tp(&tp_client_id) {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[GATE] pending_tp cleared proof=open_orders symbol={} cid={} tp_cid={}",
+                            symbol, buy_client_id, tp_client_id
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn handle_buy_submitted(
+        &mut self,
+        symbol: Symbol,
+        buy_client_order_id: String,
+        tp_client_order_id: String,
+    ) {
+        if self.config.execution.mode != ExecutionMode::Live {
+            return;
+        }
+        let Some((slot, _)) = self.capital.slot_for_client(&buy_client_order_id) else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[GATE] pending_tp skipped: slot missing symbol={} cid={}",
+                    symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+            return;
+        };
+        if self.pending_tp.is_active() {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[GATE] pending_tp replacing existing symbol={} cid={}",
+                    symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+        }
+        let now = self.clock.now_instant();
+        self.pending_tp.enter(
+            now,
+            slot,
+            symbol,
+            buy_client_order_id.clone(),
+            tp_client_order_id.clone(),
+        );
+        let _ = self.log_tx.send(LogMessage::Warn(
+            format!(
+                "[GATE] pending_tp enter symbol={} cid={} tp_cid={} timeout_secs={}",
+                symbol,
+                buy_client_order_id,
+                tp_client_order_id,
+                self.pending_tp.timeout().as_secs()
+            )
+            .into(),
+        ));
     }
 
     fn log_balance_change(
@@ -1311,6 +1591,26 @@ impl Processor {
         };
 
         if ret_from_open < self.config.trigger.trigger_pct {
+            return;
+        }
+
+        if self.pending_tp.is_active() {
+            if let Some(state) = self.pending_tp.state() {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[GATE] pending_tp suppress symbol={} pending_symbol={} cid={}",
+                        event.symbol, state.symbol, state.buy_client_id
+                    )
+                    .into(),
+                ));
+            }
+            let _ = self.log_tx.send(
+                MetricEvent::SignalSuppressed {
+                    symbol: event.symbol,
+                    reason: SignalSuppressReason::PendingTp,
+                }
+                .into(),
+            );
             return;
         }
 

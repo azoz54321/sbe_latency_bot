@@ -243,6 +243,7 @@ pub trait ExecutionProvider: Send + Sync {
     fn query_order(&self, symbol: Symbol, order_id: &str) -> Result<OrderFill, ProviderError>;
     fn find_open_order(&self, symbol: Symbol, client_order_id: &str)
         -> Result<bool, ProviderError>;
+    fn query_balance(&self, asset: &str) -> Result<Decimal, ProviderError>;
 }
 
 #[derive(Clone)]
@@ -623,6 +624,59 @@ impl ExecutionHandle {
             .unwrap_or_else(|_| Err(ProviderError::fatal("query order acknowledgement failed")))
     }
 
+    pub fn find_open_order(
+        &self,
+        symbol: Symbol,
+        client_order_id: String,
+    ) -> Result<bool, ProviderError> {
+        let (ack_tx, ack_rx) = bounded(1);
+        self.command_tx
+            .send(ExecutionCommand::FindOpenOrder {
+                symbol,
+                client_order_id,
+                ack: ack_tx,
+            })
+            .map_err(|_| ProviderError::fatal("execution command channel closed"))?;
+        ack_rx
+            .recv()
+            .unwrap_or_else(|_| Err(ProviderError::fatal("open order acknowledgement failed")))
+    }
+
+    pub fn query_balance(&self, asset: String) -> Result<Decimal, ProviderError> {
+        let (ack_tx, ack_rx) = bounded(1);
+        self.command_tx
+            .send(ExecutionCommand::QueryBalance { asset, ack: ack_tx })
+            .map_err(|_| ProviderError::fatal("execution command channel closed"))?;
+        ack_rx
+            .recv()
+            .unwrap_or_else(|_| Err(ProviderError::fatal("balance acknowledgement failed")))
+    }
+
+    pub fn place_market_sell(
+        &self,
+        symbol: Symbol,
+        qty: Decimal,
+        client_order_id: String,
+    ) -> Result<String, OrderSubmitError> {
+        let (ack_tx, ack_rx) = bounded(1);
+        self.command_tx
+            .send(ExecutionCommand::PlaceMarketSell {
+                symbol,
+                qty,
+                client_order_id,
+                ack: ack_tx,
+            })
+            .map_err(|_| {
+                OrderSubmitError::new(OrderError::Fatal, "execution command channel closed")
+            })?;
+        ack_rx.recv().unwrap_or_else(|_| {
+            Err(OrderSubmitError::new(
+                OrderError::Fatal,
+                "market sell acknowledgement failed",
+            ))
+        })
+    }
+
     pub fn update_target_notional(&self, notional: Decimal) {
         let _ = self
             .command_tx
@@ -702,6 +756,21 @@ enum ExecutionCommand {
         symbol: Symbol,
         order_id: String,
         ack: Sender<Result<OrderFill, ProviderError>>,
+    },
+    FindOpenOrder {
+        symbol: Symbol,
+        client_order_id: String,
+        ack: Sender<Result<bool, ProviderError>>,
+    },
+    QueryBalance {
+        asset: String,
+        ack: Sender<Result<Decimal, ProviderError>>,
+    },
+    PlaceMarketSell {
+        symbol: Symbol,
+        qty: Decimal,
+        client_order_id: String,
+        ack: Sender<Result<String, OrderSubmitError>>,
     },
     UpdateTargetNotional {
         notional: Decimal,
@@ -864,6 +933,27 @@ impl ExecutionEngine {
                 ack,
             } => {
                 let result = self.provider.query_order(symbol, &order_id);
+                let _ = ack.send(result);
+            }
+            ExecutionCommand::FindOpenOrder {
+                symbol,
+                client_order_id,
+                ack,
+            } => {
+                let result = self.provider.find_open_order(symbol, &client_order_id);
+                let _ = ack.send(result);
+            }
+            ExecutionCommand::QueryBalance { asset, ack } => {
+                let result = self.provider.query_balance(&asset);
+                let _ = ack.send(result);
+            }
+            ExecutionCommand::PlaceMarketSell {
+                symbol,
+                qty,
+                client_order_id,
+                ack,
+            } => {
+                let result = self.handle_place_market_sell(symbol, qty, client_order_id);
                 let _ = ack.send(result);
             }
             ExecutionCommand::UpdateTargetNotional { notional } => {
@@ -1039,6 +1129,88 @@ impl ExecutionEngine {
                     format!(
                         "[TP] placed symbol={} qty={} price={} cid={} buy_cid={}",
                         symbol, qty_str, tp_str, tp_client_order_id, buy_client_order_id
+                    )
+                    .into(),
+                ));
+                drop(permit);
+                Ok(order_id)
+            }
+            Err(err) => {
+                drop(permit);
+                Err(err)
+            }
+        }
+    }
+
+    fn handle_place_market_sell(
+        &mut self,
+        symbol: Symbol,
+        qty: Decimal,
+        client_order_id: String,
+    ) -> Result<String, OrderSubmitError> {
+        if qty <= Decimal::ZERO {
+            return Err(OrderSubmitError::new(
+                OrderError::FilterLotStep,
+                "market sell quantity zero",
+            ));
+        }
+
+        if self.config.credentials.rest_api_key.is_empty()
+            || self.config.credentials.rest_api_secret.is_empty()
+        {
+            return Err(OrderSubmitError::new(
+                OrderError::Fatal,
+                "missing credentials",
+            ));
+        }
+
+        let symbol_id = symbol_id(symbol);
+        let filters = self.filter_cache.get(symbol_id).ok_or_else(|| {
+            OrderSubmitError::new(
+                OrderError::Fatal,
+                format!("filters unavailable for {}", symbol),
+            )
+        })?;
+
+        let permit = self
+            .guards
+            .enter(symbol_id)
+            .map_err(|err| OrderSubmitError::new(OrderError::Fatal, err.to_string()))?;
+
+        let aligned_qty = floor_to_step(qty, filters.step);
+        if aligned_qty <= Decimal::ZERO {
+            drop(permit);
+            return Err(OrderSubmitError::new(
+                OrderError::FilterLotStep,
+                "market sell quantity zero after alignment",
+            ));
+        }
+
+        let qty_scale = filters.step.scale();
+        let price_scale = filters.tick.scale();
+        let now_ns = self.clock.monotonic_now_ns();
+
+        let order = ProviderOrder {
+            symbol,
+            side: "SELL",
+            order_type: "MARKET",
+            quantity: aligned_qty,
+            quantity_scale: qty_scale,
+            quote_quantity: None,
+            quote_scale: 0,
+            price: None,
+            price_scale,
+            client_order_id: client_order_id.clone(),
+            trigger_ts_mono_ns: now_ns,
+        };
+
+        match self.provider.submit_order(&order) {
+            Ok(order_id) => {
+                let qty_str = format_decimal(aligned_qty, qty_scale);
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[EMERGENCY] market_sell symbol={} qty={} cid={}",
+                        symbol, qty_str, client_order_id
                     )
                     .into(),
                 ));
@@ -1385,6 +1557,13 @@ impl ExecutionEngine {
 
         match result {
             Ok(outcome) => {
+                if self.config.execution.mode == ExecutionMode::Live {
+                    let _ = self.account_tx.send(AccountEvent::BuySubmitted {
+                        symbol: trigger.symbol,
+                        buy_client_order_id: trigger.buy_client_order_id.clone(),
+                        tp_client_order_id: trigger.tp_client_order_id.clone(),
+                    });
+                }
                 let order_ids = outcome.ids;
                 let action_instant = outcome.action_instant;
                 let price_to_action_ns = action_instant
@@ -1757,7 +1936,10 @@ fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 }
 
 fn is_unknown_order(body: &str) -> bool {
-    body.to_ascii_uppercase().contains("UNKNOWN_ORDER")
+    let upper = body.to_ascii_uppercase();
+    upper.contains("UNKNOWN_ORDER")
+        || upper.contains("-2013")
+        || upper.contains("ORDER DOES NOT EXIST")
 }
 
 fn is_numeric_id(value: &str) -> bool {
@@ -1779,6 +1961,26 @@ struct RestQueryOrderResponse {
     executed_qty: String,
     #[serde(default)]
     cummulative_quote_qty: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestOrderAck {
+    #[serde(rename = "orderId")]
+    order_id: i64,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestAccountBalance {
+    asset: String,
+    free: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestAccountResponse {
+    #[serde(default)]
+    balances: Vec<RestAccountBalance>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1963,7 +2165,32 @@ impl ExecutionProvider for RestExecutionProvider {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
-                            return Ok(order.client_order_id.clone());
+                            let body_txt = resp.text().unwrap_or_default();
+                            match serde_json::from_str::<RestOrderAck>(&body_txt) {
+                                Ok(ack) => {
+                                    if ack.order_id > 0 {
+                                        return Ok(ack.order_id.to_string());
+                                    }
+                                    let _ = self.log_tx.send(LogMessage::Warn(
+                                        format!(
+                                            "[REST] order ack missing orderId; using clientOrderId={}",
+                                            ack.client_order_id
+                                        )
+                                        .into(),
+                                    ));
+                                    return Ok(ack.client_order_id);
+                                }
+                                Err(err) => {
+                                    let _ = self.log_tx.send(LogMessage::Warn(
+                                        format!(
+                                            "[REST] order ack parse failed; using clientOrderId={} err={}",
+                                            order.client_order_id, err
+                                        )
+                                        .into(),
+                                    ));
+                                    return Ok(order.client_order_id.clone());
+                                }
+                            }
                         }
                         let body_txt = resp.text().unwrap_or_default();
                         let kind = classify_order_error(status, &body_txt);
@@ -2225,6 +2452,76 @@ impl ExecutionProvider for RestExecutionProvider {
             "openOrders failed after host failover".to_string(),
         ))
     }
+
+    fn query_balance(&self, asset: &str) -> Result<Decimal, ProviderError> {
+        let recv_window = self.config.execution.recv_window_ms.max(5_000);
+        let timestamp_ms = self.time_sync.now_ms_synced();
+        let payload = format!("recvWindow={recv_window}&timestamp={timestamp_ms}");
+        let hosts = self.order_hosts();
+        for (idx, host) in hosts.iter().enumerate() {
+            let attempt = idx + 1;
+            let signature = self.sign_payload_provider(&payload)?;
+            let url = format!(
+                "{base}/api/v3/account?{payload}&signature={signature}",
+                base = host,
+                payload = payload,
+                signature = signature
+            );
+            let response = self
+                .order_client
+                .get(&url)
+                .header("X-MBX-APIKEY", self.config.credentials.rest_api_key)
+                .send();
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let payload: RestAccountResponse = resp
+                            .json()
+                            .map_err(|err| ProviderError::fatal(err.to_string()))?;
+                        let balance = payload
+                            .balances
+                            .into_iter()
+                            .find(|bal| bal.asset.eq_ignore_ascii_case(asset))
+                            .ok_or_else(|| {
+                                ProviderError::fatal(format!("balance asset missing {}", asset))
+                            })?;
+                        let free = Decimal::from_str(&balance.free).unwrap_or(Decimal::ZERO);
+                        return Ok(free);
+                    }
+                    let body = resp.text().unwrap_or_default();
+                    let retriable_http = status.is_server_error()
+                        || status == StatusCode::REQUEST_TIMEOUT
+                        || status == StatusCode::GATEWAY_TIMEOUT
+                        || status == StatusCode::SERVICE_UNAVAILABLE;
+                    if retriable_http && attempt < hosts.len() {
+                        let next = hosts.get(idx + 1).cloned();
+                        self.log_failover("balance", attempt, host, &body, next.as_deref());
+                        continue;
+                    }
+                    return Err(self.http_error("balance", status, body, host));
+                }
+                Err(err) => {
+                    let retriable_net = err.is_timeout() || err.is_connect();
+                    if retriable_net && attempt < hosts.len() {
+                        let next = hosts.get(idx + 1).cloned();
+                        self.log_failover(
+                            "balance",
+                            attempt,
+                            host,
+                            &err.to_string(),
+                            next.as_deref(),
+                        );
+                        continue;
+                    }
+                    return Err(map_reqwest_error(err));
+                }
+            }
+        }
+        Err(ProviderError::fatal(
+            "balance failed after host failover".to_string(),
+        ))
+    }
 }
 
 struct WsExecutionProvider {
@@ -2266,5 +2563,9 @@ impl ExecutionProvider for WsExecutionProvider {
         client_order_id: &str,
     ) -> Result<bool, ProviderError> {
         self.rest.find_open_order(symbol, client_order_id)
+    }
+
+    fn query_balance(&self, asset: &str) -> Result<Decimal, ProviderError> {
+        self.rest.query_balance(asset)
     }
 }

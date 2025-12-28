@@ -151,6 +151,7 @@ pub enum SignalSuppressReason {
     NoCapital,
     NotArmed,
     Warmup,
+    PendingTp,
 }
 
 impl fmt::Display for SignalSuppressReason {
@@ -163,6 +164,7 @@ impl fmt::Display for SignalSuppressReason {
             SignalSuppressReason::NoCapital => "NoCapital",
             SignalSuppressReason::NotArmed => "NotArmed",
             SignalSuppressReason::Warmup => "Warmup",
+            SignalSuppressReason::PendingTp => "PendingTp",
         };
         write!(f, "{}", label)
     }
@@ -280,6 +282,11 @@ pub enum AccountEvent {
         balances: Vec<BalanceSnapshot>,
     },
     OpenOrders(Vec<OpenOrderSnapshot>),
+    BuySubmitted {
+        symbol: Symbol,
+        buy_client_order_id: String,
+        tp_client_order_id: String,
+    },
     LocalReject {
         client_order_id: String,
         symbol: Symbol,

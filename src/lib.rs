@@ -19,6 +19,7 @@ pub mod logging;
 pub mod metrics;
 pub mod mode;
 pub mod net;
+pub mod pending_tp;
 pub mod positions;
 pub mod private_stream;
 pub mod processor;
