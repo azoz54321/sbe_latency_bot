@@ -91,6 +91,11 @@ impl PendingTpGate {
         buy_client_id: String,
         tp_client_id: String,
     ) {
+        if let Some(state) = self.state.as_ref() {
+            if state.symbol == symbol && state.buy_client_id == buy_client_id {
+                return;
+            }
+        }
         self.state = Some(PendingTpState {
             slot,
             symbol,
@@ -384,6 +389,35 @@ mod tests {
             _ => panic!("expected cleared outcome"),
         }
         assert!(!gate.is_active());
+    }
+
+    #[test]
+    fn duplicate_enter_is_idempotent() {
+        let symbol = Symbol::from_str("ETHUSDT").expect("symbol");
+        let mut gate = PendingTpGate::new(Duration::from_secs(5));
+        let start = Instant::now() - Duration::from_secs(3);
+        gate.enter(
+            start,
+            SlotId::A,
+            symbol,
+            "BUY1".to_string(),
+            "TP1".to_string(),
+        );
+        let first_started = gate.state().unwrap().started_at;
+        let later = start + Duration::from_secs(2);
+
+        gate.enter(
+            later,
+            SlotId::A,
+            symbol,
+            "BUY1".to_string(),
+            "TP1".to_string(),
+        );
+
+        let state = gate.state().expect("state present");
+        assert_eq!(state.started_at, first_started);
+        assert_eq!(state.buy_client_id, "BUY1");
+        assert_eq!(state.tp_client_id, "TP1");
     }
 
     #[test]

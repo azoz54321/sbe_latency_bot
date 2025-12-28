@@ -326,7 +326,10 @@ impl Processor {
             ));
             return;
         };
-        if self.pending_tp.is_active() {
+        if let Some(state) = self.pending_tp.state() {
+            if state.symbol == symbol && state.buy_client_id == buy_client_order_id {
+                return;
+            }
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
                     "[GATE] pending_tp replacing existing ({}) symbol={} cid={}",
