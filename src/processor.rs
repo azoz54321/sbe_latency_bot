@@ -306,6 +306,56 @@ impl PendingTpOps for PendingTpRuntime<'_> {
 }
 
 impl Processor {
+    fn enter_pending_tp(
+        &mut self,
+        slot: SlotId,
+        symbol: Symbol,
+        buy_client_order_id: String,
+        source: &str,
+    ) {
+        if self.config.execution.mode != ExecutionMode::Live {
+            return;
+        }
+        let Some(tp_client_order_id) = self.capital.tp_client_id(slot) else {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[GATE] pending_tp skipped ({}) tp_cid missing symbol={} cid={}",
+                    source, symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+            return;
+        };
+        if self.pending_tp.is_active() {
+            let _ = self.log_tx.send(LogMessage::Warn(
+                format!(
+                    "[GATE] pending_tp replacing existing ({}) symbol={} cid={}",
+                    source, symbol, buy_client_order_id
+                )
+                .into(),
+            ));
+        }
+        let now = self.clock.now_instant();
+        self.pending_tp.enter(
+            now,
+            slot,
+            symbol,
+            buy_client_order_id.clone(),
+            tp_client_order_id.clone(),
+        );
+        let _ = self.log_tx.send(LogMessage::Warn(
+            format!(
+                "[GATE] pending_tp enter ({}) symbol={} cid={} tp_cid={} timeout_secs={}",
+                source,
+                symbol,
+                buy_client_order_id,
+                tp_client_order_id,
+                self.pending_tp.timeout().as_secs()
+            )
+            .into(),
+        ));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &'static Config,
@@ -886,6 +936,7 @@ impl Processor {
                 self.clock.now_instant(),
             );
             if let OrderRole::Buy = role {
+                self.enter_pending_tp(slot, report.symbol, client_id.clone(), "exec_new");
                 if let Some(execution) = self.execution.as_ref() {
                     execution.notify_buy_confirmed(client_id.clone());
                 }
@@ -1433,11 +1484,8 @@ impl Processor {
         &mut self,
         symbol: Symbol,
         buy_client_order_id: String,
-        tp_client_order_id: String,
+        _tp_client_order_id: String,
     ) {
-        if self.config.execution.mode != ExecutionMode::Live {
-            return;
-        }
         let Some((slot, _)) = self.capital.slot_for_client(&buy_client_order_id) else {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
@@ -1448,33 +1496,7 @@ impl Processor {
             ));
             return;
         };
-        if self.pending_tp.is_active() {
-            let _ = self.log_tx.send(LogMessage::Warn(
-                format!(
-                    "[GATE] pending_tp replacing existing symbol={} cid={}",
-                    symbol, buy_client_order_id
-                )
-                .into(),
-            ));
-        }
-        let now = self.clock.now_instant();
-        self.pending_tp.enter(
-            now,
-            slot,
-            symbol,
-            buy_client_order_id.clone(),
-            tp_client_order_id.clone(),
-        );
-        let _ = self.log_tx.send(LogMessage::Warn(
-            format!(
-                "[GATE] pending_tp enter symbol={} cid={} tp_cid={} timeout_secs={}",
-                symbol,
-                buy_client_order_id,
-                tp_client_order_id,
-                self.pending_tp.timeout().as_secs()
-            )
-            .into(),
-        ));
+        self.enter_pending_tp(slot, symbol, buy_client_order_id, "buy_submitted");
     }
 
     fn log_balance_change(
