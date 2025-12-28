@@ -65,7 +65,7 @@ impl Config {
                 latency_budget: Duration::from_millis(LATENCY_BUDGET_MS),
             },
             execution: ExecutionConfig {
-                mode: ExecutionMode::Live,
+                mode: ExecutionMode::Shadow,
                 live_armed: load_live_armed(),
                 trading_gate_enabled: TRADING_GATE_ENABLED,
                 order_quote_size_usdt: ORDER_QUOTE_SIZE_USDT,
@@ -435,7 +435,7 @@ pub struct LatencyTargets {
     pub p99_ms: f64,
 }
 
-const SBE_WS_URL: &str = "wss://stream-sbe.binance.com/ws/<symbol>@trade";
+const SBE_WS_URL: &str = "wss://stream-sbe.binance.com";
 const BINANCE_SBE_API_KEY: &str = match option_env!("BINANCE_SBE_API_KEY") {
     Some(val) => val,
     None => "",
