@@ -16,7 +16,7 @@ use crate::capital::{CapitalSlots, OrderRole, SlotId};
 use crate::channels::{SpscReceiver, SpscSender};
 use crate::clock::Clock;
 use crate::config::{Config, ExecutionMode, LogProfile, ServerSpec, ShardAssignment};
-use crate::execution::{ExecutionHandle, TargetInfo};
+use crate::execution::{ExecutionHandle, OrderStatus, TargetInfo};
 use crate::fees::{breakeven_px, sl_trigger_px, tp_target_px};
 use crate::gates::{TradingGate, WarmupGate};
 use crate::mode::{Mode, ModeMachine};
@@ -217,6 +217,7 @@ struct Processor {
     client_ids: ClientOrderIdGen,
     usdt_free: Decimal,
     usdt_free_fallback: Decimal,
+    pending_recovery: HashMap<SlotId, PendingRecovery>,
 }
 struct ShardChannel {
     receiver: SpscReceiver<PriceEvent>,
@@ -233,6 +234,12 @@ impl ClientOrderIdGen {
         let base = format!("SB-{}-{:08}", slot.label(), self.seq);
         (base.clone(), format!("{base}T"))
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingRecovery {
+    attempts: u32,
+    next_retry: Instant,
 }
 
 impl Processor {
@@ -337,6 +344,7 @@ impl Processor {
             client_ids: ClientOrderIdGen::default(),
             usdt_free: usdt_free_start,
             usdt_free_fallback: usdt_free_start,
+            pending_recovery: HashMap::new(),
         }
     }
 
@@ -399,8 +407,203 @@ impl Processor {
                 )
                 .into(),
             ));
+            let Some(buy_client_id) = timeout.client_order_id.clone() else {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[ACCT] pending_timeout missing client id slot={} symbol={}",
+                        timeout.slot.label(),
+                        timeout.symbol
+                    )
+                    .into(),
+                ));
+                let _ = self.capital.release_slot(timeout.slot);
+                self.clear_pending_recovery(timeout.slot);
+                continue;
+            };
+
+            if !self.pending_recovery_ready(timeout.slot, now) {
+                continue;
+            }
+
+            let Some(execution) = self.execution.as_ref() else {
+                let _ = self.log_tx.send(LogMessage::Warn(
+                    format!(
+                        "[ACCT] pending_timeout query skipped: execution handle missing slot={} symbol={}",
+                        timeout.slot.label(),
+                        timeout.symbol
+                    )
+                    .into(),
+                ));
+                self.schedule_pending_recovery(timeout.slot, now);
+                continue;
+            };
+
+            let lookup_id = self
+                .capital
+                .order_id(timeout.slot)
+                .unwrap_or_else(|| buy_client_id.clone());
+            match execution.query_order(timeout.symbol, lookup_id.clone()) {
+                Ok(fill) => {
+                    if fill.status == OrderStatus::Filled
+                        || fill.status == OrderStatus::PartiallyFilled
+                    {
+                        if fill.cum_filled <= Decimal::ZERO {
+                            let _ = self.log_tx.send(LogMessage::Warn(
+                                format!(
+                                    "[ACCT] pending_timeout fill qty_zero slot={} symbol={} cid={}",
+                                    timeout.slot.label(),
+                                    timeout.symbol,
+                                    buy_client_id
+                                )
+                                .into(),
+                            ));
+                            self.schedule_pending_recovery(timeout.slot, now);
+                            continue;
+                        }
+                        let avg_price = if fill.cum_quote > Decimal::ZERO {
+                            (fill.cum_quote / fill.cum_filled).normalize()
+                        } else {
+                            Decimal::ZERO
+                        };
+                        if avg_price <= Decimal::ZERO {
+                            let _ = self.log_tx.send(LogMessage::Warn(
+                                format!(
+                                    "[ACCT] pending_timeout avg_price_missing slot={} symbol={} cid={}",
+                                    timeout.slot.label(),
+                                    timeout.symbol,
+                                    buy_client_id
+                                )
+                                .into(),
+                            ));
+                            self.schedule_pending_recovery(timeout.slot, now);
+                            continue;
+                        }
+
+                        let _ = self.capital.mark_position_open(
+                            &buy_client_id,
+                            self.capital.order_id(timeout.slot),
+                        );
+                        self.ensure_position_open_from_fill(
+                            timeout.slot,
+                            timeout.symbol,
+                            fill.cum_filled,
+                            avg_price,
+                        );
+                        self.place_tp_for_fill(
+                            timeout.slot,
+                            timeout.symbol,
+                            fill.cum_filled,
+                            avg_price,
+                            buy_client_id.clone(),
+                            "pending_timeout",
+                        );
+                        self.clear_pending_recovery(timeout.slot);
+                        continue;
+                    }
+
+                    if fill.status == OrderStatus::New {
+                        let _ = self.capital.mark_reserved(
+                            &buy_client_id,
+                            self.capital.order_id(timeout.slot),
+                            now,
+                        );
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[ACCT] pending_timeout status=NEW slot={} symbol={} cid={}",
+                                timeout.slot.label(),
+                                timeout.symbol,
+                                buy_client_id
+                            )
+                            .into(),
+                        ));
+                        self.clear_pending_recovery(timeout.slot);
+                        continue;
+                    }
+
+                    if matches!(
+                        fill.status,
+                        OrderStatus::Canceled | OrderStatus::Rejected | OrderStatus::Expired
+                    ) {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[ACCT] pending_timeout status={:?} slot={} symbol={} cid={}",
+                                fill.status,
+                                timeout.slot.label(),
+                                timeout.symbol,
+                                buy_client_id
+                            )
+                            .into(),
+                        ));
+                        let _ = self.capital.release_by_client(&buy_client_id);
+                        self.clear_pending_recovery(timeout.slot);
+                        continue;
+                    }
+
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[ACCT] pending_timeout status={:?} slot={} symbol={} cid={}",
+                            fill.status,
+                            timeout.slot.label(),
+                            timeout.symbol,
+                            buy_client_id
+                        )
+                        .into(),
+                    ));
+                    self.schedule_pending_recovery(timeout.slot, now);
+                }
+                Err(err) => {
+                    if err.is_not_found() {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[ACCT] pending_timeout order not found slot={} symbol={} cid={}",
+                                timeout.slot.label(),
+                                timeout.symbol,
+                                buy_client_id
+                            )
+                            .into(),
+                        ));
+                        let _ = self.capital.release_by_client(&buy_client_id);
+                        self.clear_pending_recovery(timeout.slot);
+                    } else {
+                        let _ = self.log_tx.send(LogMessage::Warn(
+                            format!(
+                                "[ACCT] pending_timeout query failed slot={} symbol={} cid={} err={:?}",
+                                timeout.slot.label(),
+                                timeout.symbol,
+                                buy_client_id,
+                                err
+                            )
+                            .into(),
+                        ));
+                        self.schedule_pending_recovery(timeout.slot, now);
+                    }
+                }
+            }
         }
         self.rebalance_slots_if_free();
+    }
+
+    fn pending_recovery_ready(&self, slot: SlotId, now: Instant) -> bool {
+        match self.pending_recovery.get(&slot) {
+            Some(state) => now >= state.next_retry,
+            None => true,
+        }
+    }
+
+    fn schedule_pending_recovery(&mut self, slot: SlotId, now: Instant) {
+        let entry = self
+            .pending_recovery
+            .entry(slot)
+            .or_insert(PendingRecovery {
+                attempts: 0,
+                next_retry: now,
+            });
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.next_retry = now + pending_recovery_delay(entry.attempts);
+    }
+
+    fn clear_pending_recovery(&mut self, slot: SlotId) {
+        self.pending_recovery.remove(&slot);
     }
 
     fn handle_reconnect(&mut self, notice: ReconnectNotice) {
@@ -580,15 +783,22 @@ impl Processor {
         } else {
             report.last_qty
         };
-        if qty <= Decimal::ZERO {
-            return;
-        }
         let entry_price = if report.last_price > Decimal::ZERO {
             report.last_price
         } else {
             report.price
         };
-        if entry_price <= Decimal::ZERO {
+        self.ensure_position_open_from_fill(slot, report.symbol, qty, entry_price);
+    }
+
+    fn ensure_position_open_from_fill(
+        &mut self,
+        slot: SlotId,
+        symbol: Symbol,
+        qty: Decimal,
+        entry_price: Decimal,
+    ) {
+        if qty <= Decimal::ZERO || entry_price <= Decimal::ZERO {
             return;
         }
         let strategy = &self.config.strategy;
@@ -608,9 +818,9 @@ impl Processor {
             breakeven_px(entry_price, strategy.maker_fee_pct, strategy.taker_fee_pct);
         let tp_order_id = self.capital.tp_client_id(slot);
         let now = self.clock.now_instant();
-        let already_open = self.positions.contains(report.symbol);
+        let already_open = self.positions.contains(symbol);
         self.positions.open(
-            report.symbol,
+            symbol,
             qty,
             entry_price,
             slot,
@@ -623,7 +833,7 @@ impl Processor {
         );
         if !already_open {
             let now_ksa = self.config.ksa_now(self.clock.as_ref());
-            self.risk.mark_trade_open(report.symbol, now_ksa);
+            self.risk.mark_trade_open(symbol, now_ksa);
         }
     }
 
@@ -633,9 +843,6 @@ impl Processor {
         } else {
             report.last_qty
         };
-        if executed_qty <= Decimal::ZERO {
-            return;
-        }
         let avg_price = if report.cum_quote > Decimal::ZERO && report.cum_qty > Decimal::ZERO {
             (report.cum_quote / report.cum_qty).normalize()
         } else if report.last_price > Decimal::ZERO {
@@ -643,31 +850,66 @@ impl Processor {
         } else {
             report.price
         };
+        self.place_tp_for_fill(
+            slot,
+            report.symbol,
+            executed_qty,
+            avg_price,
+            report.client_order_id.clone(),
+            "",
+        );
+    }
+
+    fn place_tp_for_fill(
+        &mut self,
+        slot: SlotId,
+        symbol: Symbol,
+        executed_qty: Decimal,
+        avg_price: Decimal,
+        buy_client_order_id: String,
+        source: &str,
+    ) {
+        let context = if source.is_empty() { "" } else { " recovery" };
+        if executed_qty <= Decimal::ZERO {
+            return;
+        }
         if avg_price <= Decimal::ZERO {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
-                    "[TP] skip placement avg_price_missing symbol={} cid={}",
-                    report.symbol, report.client_order_id
+                    "[TP]{context} skip placement avg_price_missing symbol={} cid={}",
+                    symbol, buy_client_order_id
                 )
                 .into(),
             ));
             return;
         }
+        if let Some(position) = self.positions.get(symbol) {
+            if position.tp_order_id.is_some() && position.tp_order_qty > Decimal::ZERO {
+                let _ = self.log_tx.send(LogMessage::Info(
+                    format!(
+                        "[TP]{context} skip placement tp_exists symbol={} cid={}",
+                        symbol, buy_client_order_id
+                    )
+                    .into(),
+                ));
+                return;
+            }
+        }
         let Some(execution) = self.execution.as_ref() else {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
-                    "[TP] skip placement execution handle missing symbol={} cid={}",
-                    report.symbol, report.client_order_id
+                    "[TP]{context} skip placement execution handle missing symbol={} cid={}",
+                    symbol, buy_client_order_id
                 )
                 .into(),
             ));
             return;
         };
-        let Some(filters) = execution.filters_for(report.symbol) else {
+        let Some(filters) = execution.filters_for(symbol) else {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
-                    "[TP] skip placement filters missing symbol={} cid={}",
-                    report.symbol, report.client_order_id
+                    "[TP]{context} skip placement filters missing symbol={} cid={}",
+                    symbol, buy_client_order_id
                 )
                 .into(),
             ));
@@ -678,7 +920,7 @@ impl Processor {
             None => {
                 let _ = self.log_tx.send(LogMessage::Warn(
                     format!(
-                        "[TP] skip placement tp_client_id missing slot={}",
+                        "[TP]{context} skip placement tp_client_id missing slot={}",
                         slot.label()
                     )
                     .into(),
@@ -690,8 +932,8 @@ impl Processor {
         if qty_aligned <= Decimal::ZERO {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
-                    "[TP] skip placement qty_zero symbol={} qty={}",
-                    report.symbol, executed_qty
+                    "[TP]{context} skip placement qty_zero symbol={} qty={}",
+                    symbol, executed_qty
                 )
                 .into(),
             ));
@@ -704,34 +946,43 @@ impl Processor {
         if tp_price <= Decimal::ZERO {
             let _ = self.log_tx.send(LogMessage::Warn(
                 format!(
-                    "[TP] skip placement price_zero symbol={} avg_price={}",
-                    report.symbol, avg_price
+                    "[TP]{context} skip placement price_zero symbol={} avg_price={}",
+                    symbol, avg_price
                 )
                 .into(),
             ));
             return;
         }
         match execution.place_tp_limit(
-            report.symbol,
+            symbol,
             executed_qty,
             avg_price,
             tp_client_id.clone(),
-            report.client_order_id.clone(),
+            buy_client_order_id.clone(),
         ) {
             Ok(_) => {
-                if let Some(position) = self.positions.get_mut(report.symbol) {
+                if let Some(position) = self.positions.get_mut(symbol) {
                     position.take_profit = tp_price;
                     position.tp_order_id = Some(tp_client_id.clone());
                     position.tp_order_qty = qty_aligned;
                     position.tp_current_price = tp_price;
                     position.tp_initial_price = tp_price;
                 }
+                if !source.is_empty() {
+                    let _ = self.log_tx.send(LogMessage::Warn(
+                        format!(
+                            "[TP] recovery placed symbol={} cid={} qty={} avg_price={}",
+                            symbol, buy_client_order_id, executed_qty, avg_price
+                        )
+                        .into(),
+                    ));
+                }
             }
             Err(err) => {
                 let _ = self.log_tx.send(LogMessage::Warn(
                     format!(
-                        "[TP] place_failed symbol={} cid={} err={}",
-                        report.symbol, tp_client_id, err
+                        "[TP]{context} place_failed symbol={} cid={} err={}",
+                        symbol, tp_client_id, err
                     )
                     .into(),
                 ));
@@ -1721,6 +1972,13 @@ impl EthBtcRatio {
     fn ret_1h(&self) -> Option<f64> {
         return_over(&self.ring_1h, Duration::from_secs(60 * 60))
     }
+}
+
+fn pending_recovery_delay(attempts: u32) -> Duration {
+    let capped = attempts.saturating_sub(1).min(4);
+    let base_secs = 5u64.saturating_mul(1u64 << capped);
+    let jitter_ms = fastrand::u64(0..500);
+    Duration::from_secs(base_secs.min(60)) + Duration::from_millis(jitter_ms)
 }
 
 fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {

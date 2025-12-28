@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use crossbeam_channel::Sender;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -15,7 +15,10 @@ use sha2::Sha256;
 use tokio::net::TcpStream;
 use tokio::runtime::Builder;
 use tokio::time::interval;
-use tokio_tungstenite::{client_async_tls_with_config, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{
+    client_async_tls_with_config,
+    tungstenite::{client::IntoClientRequest, Message},
+};
 use url::Url;
 
 use crate::config::{Config, ExecutionMode};
@@ -146,12 +149,27 @@ async fn run_stream(
                 }
                 msg = ws_stream.next() => {
                     match msg {
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt))) => {
+                        Some(Ok(Message::Text(txt))) => {
                             if let Err(err) = handle_ws_message(&txt, &account_tx) {
                                 let _ = log_tx.send(LogMessage::Warn(format!("[ACCT] parse err: {err:?}").into()));
                             }
                         }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_))) => {}
+                        Some(Ok(Message::Ping(payload))) => {
+                            if let Err(err) = ws_stream.send(Message::Pong(payload)).await {
+                                let _ = log_tx.send(LogMessage::Warn(
+                                    format!("[ACCT] ws pong failed: {err:?}").into(),
+                                ));
+                                break;
+                            }
+                            let _ = log_tx.send(LogMessage::Info("[ACCT] ws ping -> pong".into()));
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(frame))) => {
+                            let _ = log_tx.send(LogMessage::Warn(
+                                format!("[ACCT] ws close: {frame:?}").into(),
+                            ));
+                            break;
+                        }
                         Some(Ok(_)) => {}
                         Some(Err(err)) => {
                             let _ = log_tx.send(LogMessage::Warn(format!("[ACCT] ws error: {err:?}").into()));

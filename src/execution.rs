@@ -177,6 +177,7 @@ fn verify_or_place_tp(
 #[derive(Debug, Clone, Copy)]
 pub struct OrderFill {
     pub cum_filled: Decimal,
+    pub cum_quote: Decimal,
     pub status: OrderStatus,
 }
 
@@ -604,6 +605,24 @@ impl ExecutionHandle {
         })
     }
 
+    pub fn query_order(
+        &self,
+        symbol: Symbol,
+        order_id: String,
+    ) -> Result<OrderFill, ProviderError> {
+        let (ack_tx, ack_rx) = bounded(1);
+        self.command_tx
+            .send(ExecutionCommand::QueryOrder {
+                symbol,
+                order_id,
+                ack: ack_tx,
+            })
+            .map_err(|_| ProviderError::fatal("execution command channel closed"))?;
+        ack_rx
+            .recv()
+            .unwrap_or_else(|_| Err(ProviderError::fatal("query order acknowledgement failed")))
+    }
+
     pub fn update_target_notional(&self, notional: Decimal) {
         let _ = self
             .command_tx
@@ -678,6 +697,11 @@ enum ExecutionCommand {
         quote_qty: Decimal,
         client_order_id: String,
         ack: Sender<Result<String, OrderSubmitError>>,
+    },
+    QueryOrder {
+        symbol: Symbol,
+        order_id: String,
+        ack: Sender<Result<OrderFill, ProviderError>>,
     },
     UpdateTargetNotional {
         notional: Decimal,
@@ -832,6 +856,14 @@ impl ExecutionEngine {
                 ack,
             } => {
                 let result = self.handle_quote_market_order(symbol, quote_qty, client_order_id);
+                let _ = ack.send(result);
+            }
+            ExecutionCommand::QueryOrder {
+                symbol,
+                order_id,
+                ack,
+            } => {
+                let result = self.provider.query_order(symbol, &order_id);
                 let _ = ack.send(result);
             }
             ExecutionCommand::UpdateTargetNotional { notional } => {
@@ -1727,6 +1759,10 @@ fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 fn is_unknown_order(body: &str) -> bool {
     body.to_ascii_uppercase().contains("UNKNOWN_ORDER")
 }
+
+fn is_numeric_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
 struct RestExecutionProvider {
     config: &'static Config,
     order_client: Client,
@@ -1741,6 +1777,8 @@ struct RestQueryOrderResponse {
     status: String,
     #[serde(default)]
     executed_qty: String,
+    #[serde(default)]
+    cummulative_quote_qty: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1819,8 +1857,13 @@ impl RestExecutionProvider {
     ) -> Result<String, ProviderError> {
         let recv_window = self.config.execution.recv_window_ms.max(5_000);
         let timestamp_ms = self.time_sync.now_ms_synced();
+        let id_key = if is_numeric_id(order_id) {
+            "orderId"
+        } else {
+            "origClientOrderId"
+        };
         let payload = format!(
-            "symbol={symbol}&origClientOrderId={order_id}&recvWindow={recv_window}&timestamp={timestamp}",
+            "symbol={symbol}&{id_key}={order_id}&recvWindow={recv_window}&timestamp={timestamp}",
             symbol = symbol.as_str(),
             order_id = order_id,
             recv_window = recv_window,
@@ -2053,8 +2096,11 @@ impl ExecutionProvider for RestExecutionProvider {
                             .json()
                             .map_err(|err| ProviderError::fatal(err.to_string()))?;
                         let qty = Decimal::from_str(&payload.executed_qty).unwrap_or(Decimal::ZERO);
+                        let cum_quote = Decimal::from_str(&payload.cummulative_quote_qty)
+                            .unwrap_or(Decimal::ZERO);
                         return Ok(OrderFill {
                             cum_filled: qty,
+                            cum_quote,
                             status: OrderStatus::from_str(&payload.status),
                         });
                     }

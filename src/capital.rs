@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::types::Symbol;
 use rust_decimal::Decimal;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SlotId {
     A,
     B,
@@ -227,7 +227,7 @@ impl CapitalSlots {
     pub fn expire_pending(&mut self, now: Instant) -> Vec<PendingTimeout> {
         let mut released = Vec::new();
         for idx in 0..self.slots.len() {
-            let slot = &self.slots[idx];
+            let slot = &mut self.slots[idx];
             if slot.phase != SlotPhase::PendingSend {
                 continue;
             }
@@ -249,10 +249,7 @@ impl CapitalSlots {
                     client_order_id: buy_id,
                 });
             }
-            self.remove_mappings_for_slot(slot_id);
-            if let Some(slot) = self.slots.get_mut(idx) {
-                slot.reset();
-            }
+            slot.pending_since = Some(now);
         }
         released
     }
@@ -307,6 +304,11 @@ impl CapitalSlots {
     pub fn buy_client_id(&self, slot_id: SlotId) -> Option<String> {
         let idx = self.slot_index(slot_id)?;
         self.slots[idx].buy_client_id.clone()
+    }
+
+    pub fn order_id(&self, slot_id: SlotId) -> Option<String> {
+        let idx = self.slot_index(slot_id)?;
+        self.slots[idx].order_id.clone()
     }
 
     fn slot_index(&self, slot_id: SlotId) -> Option<usize> {
